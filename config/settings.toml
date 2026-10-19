@@ -1,0 +1,14 @@
+# Paths are relative to the project root (the folder that holds config/).
+
+[paths]
+raw_dir = "data/raw"
+warehouse_path = "data/warehouse/statecast.duckdb"
+
+[ingest]
+# R = regular season, F = wild card, D = division series,
+# L = league championship series, W = World Series.
+game_types = ["R", "F", "D", "L", "W"]
+max_concurrency = 4
+timeout_seconds = 90.0
+max_retries = 5
+user_agent = "statecast/0.1 (personal research project)"

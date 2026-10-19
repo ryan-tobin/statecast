@@ -1,0 +1,33 @@
+# Environments and secrets
+.venv/
+.env
+
+# Python build and tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data, model outputs and test outputs (keep folder placeholders)
+data/**
+!data/**/
+!data/**/.gitkeep
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+tests/outputs/**
+!tests/outputs/.gitkeep
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
