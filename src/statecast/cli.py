@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Final
+from typing import Annotated, Final, NamedTuple
 
 import duckdb
 import jax
@@ -14,15 +14,25 @@ import typer
 
 from statecast.config import DEFAULT_SETTINGS_PATH, Settings, load_settings
 from statecast.evaluation.injury_alerts import (
-    INJURY_GROUPS,
+    PLACEBO_GROUP,
+    TARGET_GROUP,
+    auc_table,
     current_alerts,
     event_study,
+    group_contrast,
     label_appearances,
-    roc_auc,
+    phase_sample,
+    relative_to_healthy,
     threshold_table,
+)
+from statecast.evaluation.usage_model import (
+    coefficient_table,
+    cross_validated_auc,
+    model_sample,
 )
 from statecast.features.appearance import hitter_appearances, pitcher_appearances
 from statecast.features.injuries import il_placements
+from statecast.features.usage import pitcher_usage, relative_usage
 from statecast.ingest.pipeline import run_ingest
 from statecast.logging_setup import configure_logging
 from statecast.models.estimation import (
@@ -34,6 +44,7 @@ from statecast.models.estimation import (
 from statecast.models.kalman import ObservationBatch, batch_from_frame
 from statecast.models.trajectory import smooth_population, trajectory_frame
 from statecast.storage.model_runs import (
+    RunInfo,
     RunSpec,
     find_player,
     latest_run,
@@ -56,6 +67,7 @@ from statecast.viz.trajectories import (
 
 logger = logging.getLogger(__name__)
 ALERT_THRESHOLDS: Final = (1.0, 1.5, 2.0, 2.5, 3.0)
+MIN_MODEL_POSITIVES: Final = 20
 
 app = typer.Typer(help="statecast data pipeline.", no_args_is_help=True)
 
@@ -201,6 +213,17 @@ def _echo_table(table: pl.DataFrame) -> None:
         typer.echo(table)
 
 
+def _echo_section(title: str, table: pl.DataFrame) -> None:
+    """Print a heading, then a table in full.
+
+    Args:
+        title: Heading.
+        table: Table to print.
+    """
+    typer.echo(f"\n{title}")
+    _echo_table(table)
+
+
 def _run_spec(
     role: Role, seasons: list[int], metric: str | None, pitch_type: str
 ) -> RunSpec:
@@ -328,6 +351,73 @@ def chart(
     typer.echo(output)
 
 
+class AlertInputs(NamedTuple):
+    """Everything the alerts report reads from the warehouse.
+
+    Attributes:
+        run: The scored run.
+        states: Real-time alert scores per appearance.
+        placements: Every IL placement.
+        usage: Real-time workload scores per appearance.
+    """
+
+    run: RunInfo
+    states: pl.DataFrame
+    placements: pl.DataFrame
+    usage: pl.DataFrame
+
+
+def _load_alert_inputs(warehouse_path: Path, spec: RunSpec) -> AlertInputs:
+    """Read the latest scored run, IL placements and workload.
+
+    Args:
+        warehouse_path: DuckDB database file.
+        spec: Role, metric and pitch type of the run.
+
+    Returns:
+        The inputs for the alerts report.
+
+    Raises:
+        typer.Exit: With code 1 if no run exists or it has no alert scores.
+    """
+    with duckdb.connect(str(warehouse_path), read_only=True) as con:
+        try:
+            run = latest_run(con, spec)
+        except LookupError as error:
+            logger.error("%s; run `statecast trajectory pitcher` first", error)
+            raise typer.Exit(code=1) from error
+        states = load_alert_states(con, run.run_id)
+        if states.is_empty():
+            logger.error("Run %s has no alert scores; rerun trajectory", run.run_id)
+            raise typer.Exit(code=1)
+        seasons = sorted(set(states["game_date"].dt.year().to_list()))
+        usage = relative_usage(pitcher_usage(con, seasons))
+        return AlertInputs(run, states, il_placements(con), usage)
+
+
+def _echo_usage_model(labeled: pl.DataFrame, usage: pl.DataFrame, horizon: int) -> None:
+    """Print whether velocity adds to workload, if there is enough data.
+
+    Args:
+        labeled: Output of ``label_appearances``.
+        usage: Output of ``relative_usage``.
+        horizon: Days before a placement that count.
+    """
+    warning = phase_sample(labeled, horizon, TARGET_GROUP, "warning")
+    sample = model_sample(warning, usage)
+    positives = int(sample["positive"].sum())
+    if positives < MIN_MODEL_POSITIVES or sample.height - positives < positives:
+        logger.warning("Only %d warning games before arm stints; skipping", positives)
+        return
+    _echo_section(
+        "Arm IL odds ratio per sd, warning games (95% cluster-robust)",
+        coefficient_table(sample),
+    )
+    _echo_section(
+        "Out-of-fold AUC, folds split by pitcher", cross_validated_auc(sample)
+    )
+
+
 @app.command()
 def alerts(
     pitch_type: PitchTypeOption = "FF",
@@ -337,15 +427,16 @@ def alerts(
 ) -> None:
     """Test whether real-time velocity drops come before IL placements.
 
-    Uses the latest pitcher velocity run for the pitch type. Prints how well
-    each alert threshold warns of arm IL placements, the AUC for arm and
-    other injuries, and pitchers on alert after their latest game, then draws
-    the event-study chart.
+    Uses the latest pitcher velocity run for the pitch type. Prints the
+    warning-game threshold table, AUCs by injury group and phase with
+    pitcher-bootstrap intervals, the arm-minus-lower-body contrast, whether
+    velocity adds to workload, and end-of-season alerts with what came next,
+    then draws the event-study chart.
 
     Args:
         pitch_type: Pitch type of the run to score, such as ``FF``.
         horizon_days: Days after a game that count as before an IL stint.
-        threshold: Alert threshold for the current-alerts table.
+        threshold: Alert threshold for the end-of-season table.
         settings_path: Path to ``settings.toml``.
 
     Raises:
@@ -353,34 +444,42 @@ def alerts(
     """
     settings = _load_or_exit(settings_path)
     spec = RunSpec(Role.PITCHER, "release_speed", pitch_type, ())
-    with duckdb.connect(str(settings.paths.warehouse_path), read_only=True) as con:
-        try:
-            run = latest_run(con, spec)
-        except LookupError as error:
-            logger.error("%s; run `statecast trajectory pitcher` first", error)
-            raise typer.Exit(code=1) from error
-        states = load_alert_states(con, run.run_id)
-        placements = il_placements(con)
-    if states.is_empty():
-        logger.error("Run %s has no alert scores; rerun trajectory", run.run_id)
-        raise typer.Exit(code=1)
-    labeled = label_appearances(states, placements)
-    _echo_table(threshold_table(labeled, ALERT_THRESHOLDS, horizon_days))
-    for group in INJURY_GROUPS:
-        auc = roc_auc(labeled, horizon_days, group)
-        typer.echo(f"AUC, {group} IL within {horizon_days} days: {auc:.3f}")
-    _echo_table(current_alerts(labeled, threshold))
-    seasons = sorted(set(states["game_date"].dt.year().to_list()))
-    pitch_name = (run.pitch_name or pitch_type).lower()
+    inputs = _load_alert_inputs(settings.paths.warehouse_path, spec)
+    labeled = label_appearances(inputs.states, inputs.placements)
+    study = event_study(labeled)
+    _echo_section(
+        f"Warning games before arm IL stints within {horizon_days} days",
+        threshold_table(labeled, ALERT_THRESHOLDS, horizon_days),
+    )
+    _echo_section(
+        "AUC against healthy games (95% pitcher-bootstrap intervals)",
+        auc_table(labeled, horizon_days),
+    )
+    _echo_section(
+        f"Mean alert score, {TARGET_GROUP} minus {PLACEBO_GROUP}, by appearance",
+        group_contrast(study, TARGET_GROUP, PLACEBO_GROUP),
+    )
+    _echo_usage_model(labeled, inputs.usage, horizon_days)
+    _echo_section(
+        f"End-of-season alerts at or below -{threshold} sd, and what came next",
+        current_alerts(inputs.states, inputs.placements, threshold),
+    )
+    seasons = sorted(set(inputs.states["game_date"].dt.year().to_list()))
+    pitch_name = (inputs.run.pitch_name or pitch_type).lower()
     title = f"Velocity before injured-list stints, {pitch_name}"
     subtitle = (
-        f"Mean real-time alert score by appearance, "
+        f"Mean real-time alert score by appearance relative to healthy games, "
         f"{season_span(seasons)} regular season"
     )
+    try:
+        figure = plot_event_study(relative_to_healthy(study), title, subtitle)
+    except ValueError as error:
+        logger.error("No event-study chart: %s", error)
+        raise typer.Exit(code=1) from error
     output = settings.paths.figures_dir / figure_filename(
         "il event study", spec.metric, pitch_type
     )
-    save_figure(plot_event_study(event_study(labeled), title, subtitle), output)
+    save_figure(figure, output)
     typer.echo(output)
 
 

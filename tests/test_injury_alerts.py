@@ -7,11 +7,15 @@ import polars as pl
 import pytest
 
 from statecast.evaluation.injury_alerts import (
+    auc_table,
     current_alerts,
     event_study,
+    group_contrast,
     label_appearances,
-    roc_auc,
+    phase_sample,
+    relative_to_healthy,
     threshold_table,
+    weighted_auc,
 )
 from statecast.evaluation.simulate import Schedule, simulate_population
 from statecast.models.kalman import PopulationParams
@@ -38,6 +42,7 @@ def placements(rows: list[tuple[int, date, str]]) -> pl.DataFrame:
             "player_id": [row[0] for row in rows],
             "il_start": [row[1] for row in rows],
             "injury_group": [row[2] for row in rows],
+            "injury": [f"{row[2]} injury" for row in rows],
         }
     )
 
@@ -57,75 +62,123 @@ GAMES = states(
 STINTS = placements(
     [
         (1, date(2025, 5, 14), "arm"),
-        (2, date(2025, 5, 20), "other"),
+        (2, date(2025, 5, 20), "lower_body"),
         (2, date(2025, 5, 7), "arm"),
     ]
 )
 
 
-def test_label_appearances_finds_the_next_placement_after_each_game() -> None:
+def test_label_appearances_finds_next_placement_and_final_game() -> None:
     labeled = label_appearances(GAMES, STINTS)
 
-    rows = labeled.select("player_id", "days_to_il", "injury_group").rows()
-    assert rows == [
-        (1, 13, "arm"),
-        (1, 8, "arm"),
-        (1, 3, "arm"),
-        (2, 5, "arm"),
-        (2, 13, "other"),
-        (2, None, None),
-        (3, None, None),
-        (3, None, None),
+    rows = labeled.select("player_id", "days_to_il", "injury_group", "is_final")
+    assert rows.rows() == [
+        (1, 13, "arm", False),
+        (1, 8, "arm", False),
+        (1, 3, "arm", True),
+        (2, 5, "arm", True),
+        (2, 13, "lower_body", True),
+        (2, None, None, False),
+        (3, None, None, False),
+        (3, None, None, False),
     ]
 
 
-def test_event_study_numbers_games_back_from_the_placement() -> None:
+def test_phase_sample_keeps_one_phase_and_healthy_games() -> None:
     labeled = label_appearances(GAMES, STINTS)
 
-    study = event_study(labeled, max_starts=2)
+    warning = phase_sample(labeled, 30, "arm", "warning")
+    detection = phase_sample(labeled, 30, "arm", "detection")
 
-    arm = study.filter(pl.col("group") == "arm")
-    assert arm["starts_before"].to_list() == [-2, -1]
-    np.testing.assert_allclose(arm["mean_z"], [-1.2, (-2.6 + 0.1) / 2])
-    healthy = study.filter(pl.col("group") == "healthy").row(0, named=True)
-    assert healthy["starts_before"] is None
-    assert healthy["appearances"] == 3
-    np.testing.assert_allclose(healthy["mean_z"], (-2.2 - 2.1 + 0.3) / 3)
+    assert warning.filter(pl.col("positive"))["alert_z"].to_list() == [0.2, -1.2]
+    assert detection.filter(pl.col("positive"))["alert_z"].to_list() == [-2.6, 0.1]
+    assert warning.filter(~pl.col("positive"))["alert_z"].to_list() == [
+        -2.2,
+        -2.1,
+        0.3,
+    ]
 
 
-def test_roc_auc_ranks_pre_injury_games_low() -> None:
+def test_weighted_auc_counts_ties_as_half_and_uses_weights() -> None:
+    scores = np.array([2.0, 1.0, 1.0, 0.0])
+    positive = np.array([True, True, False, False])
+
+    unweighted = weighted_auc(scores, positive, np.ones(4))
+    doubled_tie = weighted_auc(scores, positive, np.array([1.0, 2.0, 1.0, 1.0]))
+
+    assert unweighted == pytest.approx((2 + 1.5) / 4)
+    assert doubled_tie == pytest.approx((2 + 2 * 1.5) / 6)
+
+
+def test_auc_table_point_estimates_and_target_minus_placebo() -> None:
     labeled = label_appearances(GAMES, STINTS)
 
-    arm = roc_auc(labeled, 30, "arm")
-    nothing = roc_auc(labeled, 30, "elbow-only")
+    table = auc_table(labeled, 30, reps=50)
 
-    positives = [0.2, -1.2, -2.6, 0.1]
-    negatives = [-0.4, -2.2, -2.1, 0.3]
-    expected = np.mean([[p < n for n in negatives] for p in positives])
-    np.testing.assert_allclose(arm, expected)
-    assert np.isnan(nothing)
+    rows = {(row["group"], row["phase"]): row for row in table.iter_rows(named=True)}
+    assert rows["arm", "warning"]["auc"] == pytest.approx(2 / 6)
+    assert rows["arm", "warning"]["placements"] == 1
+    assert rows["arm", "detection"]["auc"] == pytest.approx(4 / 6)
+    assert rows["arm", "detection"]["placements"] == 2
+    assert rows["lower_body", "detection"]["auc"] == pytest.approx(1 / 3)
+    assert np.isnan(rows["lower_body", "warning"]["auc"])
+    difference = rows["arm - lower_body", "detection"]
+    assert difference["auc"] == pytest.approx(4 / 6 - 1 / 3)
+    assert difference["placements"] is None
 
 
-def test_threshold_table_counts_alerts_precision_and_lead_time() -> None:
+def test_threshold_table_scores_warning_games_against_healthy_ones() -> None:
     labeled = label_appearances(GAMES, STINTS)
 
     table = threshold_table(labeled, [1.0, 2.0], horizon_days=30)
 
     one, two = table.rows(named=True)
-    assert one["alert_rate"] == pytest.approx(4 / 8)
-    assert one["precision"] == pytest.approx(2 / 4)
-    assert one["lift"] == pytest.approx((2 / 4) / (4 / 8))
-    assert (one["events_caught"], one["events"]) == (1, 2)
+    assert one["alert_rate"] == pytest.approx(3 / 5)
+    assert one["precision"] == pytest.approx(1 / 3)
+    assert one["lift"] == pytest.approx((1 / 3) / (2 / 5))
+    assert (one["events_caught"], one["events"]) == (1, 1)
     assert one["median_lead_days"] == 8.0
-    assert two["alert_rate"] == pytest.approx(3 / 8)
-    assert two["median_lead_days"] == 3.0
+    assert two["alert_rate"] == pytest.approx(2 / 5)
+    assert two["events_caught"] == 0
 
 
-def test_current_alerts_use_each_pitchers_latest_game() -> None:
-    alerts = current_alerts(GAMES, threshold=2.0)
+def test_event_study_relative_shift_and_contrast() -> None:
+    labeled = label_appearances(GAMES, STINTS)
+    study = event_study(labeled, max_starts=2)
+
+    relative = relative_to_healthy(study)
+    contrast = group_contrast(study, "arm", "lower_body")
+
+    healthy_mean = (-2.2 - 2.1 + 0.3) / 3
+    arm = relative.filter(pl.col("group") == "arm").sort("starts_before")
+    np.testing.assert_allclose(
+        arm["shift"], [-1.2 - healthy_mean, (-2.6 + 0.1) / 2 - healthy_mean]
+    )
+    last = arm.row(-1, named=True)
+    healthy_se = np.std([-2.2, -2.1, 0.3], ddof=1) / np.sqrt(3)
+    arm_se = np.std([-2.6, 0.1], ddof=1) / np.sqrt(2)
+    half_width = 1.959963984540054 * np.hypot(healthy_se, arm_se)
+    assert last["upper_95"] - last["shift"] == pytest.approx(half_width)
+    assert contrast["starts_before"].to_list() == [-1]
+    assert contrast["difference"][0] == pytest.approx(-1.25 + 0.4)
+
+
+def test_relative_to_healthy_requires_a_baseline() -> None:
+    study = event_study(label_appearances(GAMES, STINTS), max_starts=2)
+
+    with pytest.raises(ValueError, match="no healthy baseline"):
+        relative_to_healthy(study.filter(pl.col("group") != "healthy"))
+
+
+def test_current_alerts_report_what_happened_next() -> None:
+    alerts = current_alerts(
+        GAMES, placements([(2, date(2025, 9, 1), "arm")]), threshold=2.0
+    )
 
     assert alerts["full_name"].to_list() == ["Pitcher 1", "Pitcher 2"]
     assert alerts["alert_z"].to_list() == [-2.6, -2.2]
+    assert alerts["next_il"].to_list() == [None, date(2025, 9, 1)]
+    assert alerts["injury"].to_list() == [None, "arm injury"]
 
 
 SIM_PARAMS = PopulationParams(
@@ -148,7 +201,7 @@ def simulated_injuries() -> tuple[pl.DataFrame, pl.DataFrame]:
     """Pitchers whose velocity fades over 5 starts before an arm IL stint.
 
     The first ``INJURED`` pitchers lose up to 1.5 mph before an arm placement;
-    the next ``INJURED`` get an "other" placement with no velocity change.
+    the next ``INJURED`` get a lower-body placement with no velocity change.
     """
     days = 30.0 + 5.0 * jnp.arange(SIM_STARTS)
     schedule = Schedule(jnp.concatenate([jnp.zeros(1), jnp.diff(days)]), days)
@@ -176,7 +229,10 @@ def simulated_injuries() -> tuple[pl.DataFrame, pl.DataFrame]:
     stint_start = dates[-1] + timedelta(days=3)
     stints = placements(
         [(player, stint_start, "arm") for player in range(INJURED)]
-        + [(player, stint_start, "other") for player in range(INJURED, 2 * INJURED)]
+        + [
+            (player, stint_start, "lower_body")
+            for player in range(INJURED, 2 * INJURED)
+        ]
     )
     return paths, stints
 
@@ -187,23 +243,34 @@ def simulated_labels() -> pl.DataFrame:
     return label_appearances(paths, stints)
 
 
-def test_simulated_velocity_fade_warns_of_arm_injuries_only(
+def test_simulated_fade_shifts_arm_scores_below_healthy_only(
     simulated_labels: pl.DataFrame,
 ) -> None:
-    labeled = simulated_labels
+    study = event_study(simulated_labels, max_starts=8)
 
-    study = event_study(labeled, max_starts=8)
+    relative = relative_to_healthy(study)
+    contrast = group_contrast(study, "arm", "lower_body")
 
-    arm = study.filter(pl.col("group") == "arm").sort("starts_before")
-    other = study.filter(pl.col("group") == "other").sort("starts_before")
-    healthy = study.filter(pl.col("group") == "healthy")
-    assert float(arm["mean_z"][0]) > -0.3
-    assert float(arm["mean_z"][-1]) < -1.0
-    assert bool((arm["mean_z"].diff().drop_nulls() < 0.05).all())
-    assert abs(float(other["mean_z"][-1])) < 0.4
-    assert abs(float(healthy["mean_z"][0])) < 0.1
-    assert roc_auc(labeled, 30, "arm") > 0.6
-    assert abs(roc_auc(labeled, 30, "other") - 0.5) < 0.1
+    arm = relative.filter(pl.col("group") == "arm").sort("starts_before")
+    placebo = relative.filter(pl.col("group") == "lower_body").sort("starts_before")
+    assert float(arm["shift"][0]) > -0.3
+    assert float(arm["upper_95"][-1]) < -1.0
+    assert float(placebo["lower_95"][-1]) < 0.0 < float(placebo["upper_95"][-1])
+    assert float(contrast["upper_95"][-1]) < 0.0
+
+
+def test_simulated_auc_is_higher_at_detection_than_warning(
+    simulated_labels: pl.DataFrame,
+) -> None:
+    table = auc_table(simulated_labels, 30, reps=200)
+
+    rows = {(row["group"], row["phase"]): row for row in table.iter_rows(named=True)}
+    warning = rows["arm", "warning"]["auc"]
+    detection = rows["arm", "detection"]["auc"]
+    assert detection > warning > 0.55
+    assert abs(rows["lower_body", "warning"]["auc"] - 0.5) < 0.1
+    assert rows["arm - lower_body", "warning"]["auc"] > 0.0
+    assert rows["arm - lower_body", "detection"]["lower_95"] > 0.2
 
 
 def test_simulated_alert_rate_matches_the_normal_tail(

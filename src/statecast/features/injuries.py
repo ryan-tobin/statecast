@@ -30,6 +30,14 @@ ARM_PATTERN: Final = (
     r"|labrum|tommy john|arm|upper extremity|thoracic outlet|lat|latissimus"
     r"|teres)\b"
 )
+TRUNK_PATTERN: Final = (
+    r"(?i)\b(oblique|back|lumbar|spine|spinal|rib|ribs|intercostal|abdominal"
+    r"|abdomen|side|core|chest|pectoral|neck|trapezius|thoracic)\b"
+)
+LOWER_BODY_PATTERN: Final = (
+    r"(?i)\b(hip|groin|adductor|hamstring|quad|quadriceps|thigh|knee|meniscus"
+    r"|acl|patellar|calf|shin|ankle|achilles|foot|heel|toe|plantar|leg|glute)\b"
+)
 
 
 def parse_placements(transactions: pl.DataFrame) -> pl.DataFrame:
@@ -42,7 +50,10 @@ def parse_placements(transactions: pl.DataFrame) -> pl.DataFrame:
     Returns:
         One row per placement: ``transaction_id``, ``player_id``,
         ``il_start``, ``il_days``, ``injury`` (empty when not given) and
-        ``injury_group`` (``arm`` or ``other``).
+        ``injury_group``: ``arm`` (throwing arm and shoulder), ``trunk``
+        (back, oblique, ribs), ``lower_body`` (hips down) or ``other``
+        (illness, concussion, hand, unspecified). The first matching group in
+        that order wins, so "thoracic outlet" is an arm injury.
 
     Example:
         >>> from datetime import date
@@ -70,6 +81,10 @@ def parse_placements(transactions: pl.DataFrame) -> pl.DataFrame:
         injury=injury,
         injury_group=pl.when(injury.str.contains(ARM_PATTERN))
         .then(pl.lit("arm"))
+        .when(injury.str.contains(TRUNK_PATTERN))
+        .then(pl.lit("trunk"))
+        .when(injury.str.contains(LOWER_BODY_PATTERN))
+        .then(pl.lit("lower_body"))
         .otherwise(pl.lit("other")),
     )
 

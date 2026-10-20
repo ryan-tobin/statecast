@@ -1,4 +1,4 @@
-"""Event-study chart: real-time alert scores in the games before an IL stint."""
+"""Event-study chart: alert scores before IL stints, relative to healthy games."""
 
 from itertools import pairwise
 from typing import Final, NamedTuple
@@ -12,15 +12,18 @@ from matplotlib.figure import Figure
 from statecast.viz import theme
 
 FIGURE_WIDTH_IN: Final = 10.0
-FIGURE_HEIGHT_IN: Final = 5.6
+FIGURE_HEIGHT_IN: Final = 5.8
 LABEL_GAP_FRACTION: Final = 0.07
+DETECTION_EDGE: Final = -1.5
 GROUP_STYLES: Final[dict[str, tuple[str, str]]] = {
-    "arm": (theme.SERIES_ORANGE, "Arm injury"),
-    "other": (theme.SERIES_BLUE, "Other injury"),
+    "arm": (theme.SERIES_ORANGE, "Arm"),
+    "trunk": (theme.SERIES_AQUA, "Trunk"),
+    "lower_body": (theme.SERIES_BLUE, "Lower body"),
 }
 FOOTNOTE: Final = (
     "Alert score: real-time talent minus the pitcher's own level, from games "
     "already pitched, scaled to be N(0, 1) when nothing is wrong.\n"
+    "Shown as the difference from healthy games (no IL stint within 60 days). "
     "Bands are 95% intervals; counts are IL placements."
 )
 
@@ -63,55 +66,33 @@ def spread_labels(positions: list[float], gap: float) -> list[float]:
 
 
 def _placements(line: pl.DataFrame) -> int:
-    """Placements behind a group's line: the count at its last appearance."""
-    return int(line.filter(pl.col("starts_before") == -1)["appearances"].sum())
-
-
-def _draw_baseline(axes: Axes, healthy: pl.DataFrame) -> LineLabel | None:
-    """Dashed line and band for appearances with no IL stint ahead."""
-    if healthy.is_empty():
-        return None
-    baseline = healthy.row(0, named=True)
-    axes.axhspan(
-        baseline["lower_95"],
-        baseline["upper_95"],
-        color=theme.INK_MUTED,
-        alpha=0.15,
-        linewidth=0,
-    )
-    axes.axhline(
-        baseline["mean_z"],
-        color=theme.INK_MUTED,
-        linewidth=1.25,
-        linestyle=(0, (4, 2)),
-        zorder=2,
-    )
-    return LineLabel(float(baseline["mean_z"]), "No IL stint within 60 days", False)
+    """Placements behind a group's line: the count at its final game."""
+    return int(line.filter(pl.col("starts_before") == -1)["placements"].sum())
 
 
 def _draw_group(axes: Axes, line: pl.DataFrame, color: str, label: str) -> LineLabel:
     """Band, line and dots for one injury group."""
     x = line["starts_before"].to_numpy()
-    mean = line["mean_z"].to_numpy()
+    shift = line["shift"].to_numpy()
     axes.fill_between(
         x,
         line["lower_95"].to_numpy(),
         line["upper_95"].to_numpy(),
         color=color,
-        alpha=0.15,
+        alpha=0.13,
         linewidth=0,
     )
-    axes.plot(x, mean, color=color, linewidth=2.0, zorder=3)
+    axes.plot(x, shift, color=color, linewidth=2.0, zorder=3)
     axes.scatter(
         x,
-        mean,
+        shift,
         s=30,
         color=color,
         edgecolors=theme.SURFACE,
         linewidths=1.5,
         zorder=4,
     )
-    return LineLabel(float(mean[-1]), f"{label} ({_placements(line):,})", True)
+    return LineLabel(float(shift[-1]), f"{label} ({_placements(line):,})", True)
 
 
 def _label_line_ends(axes: Axes, labels: list[LineLabel]) -> None:
@@ -135,50 +116,67 @@ def _label_line_ends(axes: Axes, labels: list[LineLabel]) -> None:
         )
 
 
+def _mark_phases(axes: Axes, first: int) -> None:
+    """Shade the final game and name the warning and detection phases."""
+    axes.axvspan(DETECTION_EDGE, -0.6, color=theme.GRIDLINE, alpha=0.5, linewidth=0)
+    for x, text in (((first + DETECTION_EDGE) / 2, "Warning games"), (-1, "Final")):
+        axes.annotate(
+            text,
+            (x, 1.0),
+            xycoords=("data", "axes fraction"),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color=theme.INK_SECONDARY,
+        )
+
+
 def _style_axes(axes: Axes, first: int) -> None:
-    """Ticks counting back to the last game, labels and gridlines."""
+    """Ticks counting back to the final game, labels and gridlines."""
     axes.set_xticks(range(first, 0))
-    axes.set_xticklabels(["Last game" if k == -1 else str(k) for k in range(first, 0)])
+    axes.set_xticklabels(["Final" if k == -1 else str(k) for k in range(first, 0)])
     axes.set_xlim(first - 0.4, -0.6)
     axes.set_xlabel("Appearances before the IL placement")
-    axes.set_ylabel("Alert score (sd from own level)")
+    axes.set_ylabel("Alert score minus healthy games (sd)")
     axes.grid(axis="y")
     axes.set_axisbelow(True)
     for side in ("top", "right", "left"):
         axes.spines[side].set_visible(False)
 
 
-def plot_event_study(study: pl.DataFrame, title: str, subtitle: str) -> Figure:
-    """Draw mean alert score by appearances before IL placement, with intervals.
+def plot_event_study(relative: pl.DataFrame, title: str, subtitle: str) -> Figure:
+    """Draw each injury group's alert score relative to healthy games.
 
     Args:
-        study: Output of ``event_study``.
+        relative: Output of ``relative_to_healthy``.
         title: Headline.
-        subtitle: What the score is and which run it came from.
+        subtitle: Which run and seasons.
 
     Returns:
         The figure.
 
     Raises:
-        ValueError: If the study has no pre-placement appearances.
+        ValueError: If no charted injury group has any appearances.
     """
-    groups = study.filter(pl.col("starts_before").is_not_null())
-    if groups.is_empty():
+    charted = relative.filter(pl.col("group").is_in(list(GROUP_STYLES)))
+    if charted.is_empty():
         raise ValueError("Event study has no appearances before a placement")
-    first = int(groups["starts_before"].min())  # type: ignore[arg-type]
+    first = int(charted["starts_before"].min())  # type: ignore[arg-type]
     with mpl.rc_context(theme.RC_PARAMS):
         figure = Figure(figsize=(FIGURE_WIDTH_IN, FIGURE_HEIGHT_IN), dpi=200)
         axes = figure.subplots()
-        axes.axhline(0.0, color=theme.AXIS_LINE, linewidth=1.0, zorder=1)
-        labels: list[LineLabel] = []
-        baseline = _draw_baseline(axes, study.filter(pl.col("group") == "healthy"))
-        if baseline is not None:
-            labels.append(baseline)
+        axes.axhline(
+            0.0, color=theme.INK_MUTED, linewidth=1.25, linestyle=(0, (4, 2)), zorder=2
+        )
+        labels = [LineLabel(0.0, "Healthy games", False)]
         for group, (color, label) in GROUP_STYLES.items():
-            line = groups.filter(pl.col("group") == group).sort("starts_before")
+            line = charted.filter(pl.col("group") == group).sort("starts_before")
             if not line.is_empty():
                 labels.append(_draw_group(axes, line, color, label))
         _style_axes(axes, first)
+        _mark_phases(axes, first)
         _label_line_ends(axes, labels)
         figure.text(
             0.015,
@@ -201,5 +199,5 @@ def plot_event_study(study: pl.DataFrame, title: str, subtitle: str) -> Figure:
             va="bottom",
             linespacing=1.4,
         )
-        figure.subplots_adjust(left=0.08, right=0.76, top=0.8, bottom=0.2)
+        figure.subplots_adjust(left=0.08, right=0.8, top=0.78, bottom=0.21)
     return figure

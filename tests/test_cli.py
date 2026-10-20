@@ -1,9 +1,10 @@
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
 import jax
 import jax.numpy as jnp
+import numpy as np
 import polars as pl
 import pytest
 from typer.testing import CliRunner
@@ -14,6 +15,7 @@ from statecast.ingest.pipeline import IngestSummary
 from statecast.ingest.savant import StatcastIngestSummary
 from statecast.models.estimation import FitResult
 from statecast.models.kalman import ObservationBatch, PopulationParams, unconstrain
+from statecast.storage.model_runs import RunSpec, save_run
 from statecast.storage.warehouse import initialize_schema, upsert_table
 
 PROJECT_SETTINGS = Path(__file__).parent.parent / "config" / "settings.toml"
@@ -222,13 +224,14 @@ def test_trajectory_then_chart_end_to_end(
     output_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     params = model_params(jnp.array([-0.2, -0.1, -0.03, 0.04, 0.03, 0.0]))
+    game_dates = [date(2026, 4, 1), date(2026, 4, 6), date(2026, 4, 11)]
     frame = pl.DataFrame(
         {
-            "player_id": [554430] * 3,
-            "game_date": [date(2026, 4, 1), date(2026, 4, 6), date(2026, 4, 11)],
-            "sample_size": [30, 28, 31],
-            "mean": [96.1, 95.8, 96.3],
-            "within_ss": [25.0, 22.0, 26.0],
+            "player_id": [554430] * 3 + [605400] * 3,
+            "game_date": game_dates * 2,
+            "sample_size": [30, 28, 31, 25, 27, 26],
+            "mean": [96.1, 95.8, 96.3, 93.0, 93.2, 92.9],
+            "within_ss": [25.0, 22.0, 26.0, 20.0, 21.0, 19.0],
         }
     )
 
@@ -250,7 +253,12 @@ def test_trajectory_then_chart_end_to_end(
         upsert_table(
             connection,
             "player",
-            pl.DataFrame({"player_id": [554430], "full_name": ["Zack Wheeler"]}),
+            pl.DataFrame(
+                {
+                    "player_id": [554430, 605400],
+                    "full_name": ["Zack Wheeler", "Aaron Nola"],
+                }
+            ),
         )
 
     stored = runner.invoke(
@@ -310,7 +318,8 @@ def test_trajectory_then_chart_end_to_end(
     alerted = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
 
     assert alerted.exit_code == 0, alerted.output
-    assert "AUC, arm IL within 30 days" in alerted.output
+    assert "AUC against healthy games" in alerted.output
+    assert "End-of-season alerts" in alerted.output
     assert (figures / "il_event_study_ff_release_speed.png").exists()
 
 
@@ -318,6 +327,106 @@ def test_alerts_exits_nonzero_without_a_run(output_dir: Path) -> None:
     settings_path = fit_settings(output_dir)
     with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
         initialize_schema(connection)
+
+    result = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
+
+    assert result.exit_code == 1
+
+
+def test_chart_exits_nonzero_for_unknown_player(output_dir: Path) -> None:
+    settings_path = fit_settings(output_dir)
+    with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
+        initialize_schema(connection)
+
+    result = runner.invoke(
+        cli.app, ["chart", "Nobody Here", "--settings", str(settings_path)]
+    )
+
+    assert result.exit_code == 1
+
+
+def usage_report_inputs(players: int, arm_players: int) -> tuple[pl.DataFrame, ...]:
+    """Labeled games and workload where some pitchers fade before arm stints."""
+    rng = np.random.default_rng(5)
+    games = 30
+    player_id = np.repeat(np.arange(players), games)
+    start = date(2026, 4, 1)
+    game_date = [start + timedelta(days=5 * k) for k in range(games)] * players
+    final_window = np.tile(np.arange(games) >= games - 4, players)
+    injured = (player_id < arm_players) & final_window
+    labeled = pl.DataFrame(
+        {
+            "player_id": player_id,
+            "game_date": game_date,
+            "alert_z": rng.normal(size=player_id.size) - 1.5 * injured,
+            "injured": injured,
+            "is_final": np.zeros(player_id.size, dtype=bool),
+        }
+    ).with_columns(
+        days_to_il=pl.when(pl.col("injured")).then(10),
+        injury_group=pl.when(pl.col("injured")).then(pl.lit("arm")),
+    )
+    usage = labeled.select(
+        "player_id",
+        "game_date",
+        pitches_z=pl.lit(rng.normal(size=player_id.size)),
+        rest_z=pl.lit(rng.normal(size=player_id.size)),
+    )
+    return labeled, usage
+
+
+def test_usage_model_report_prints_odds_ratios_and_cv_auc(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    labeled, usage = usage_report_inputs(players=200, arm_players=40)
+
+    cli._echo_usage_model(labeled, usage, 30)
+
+    printed = capsys.readouterr().out
+    assert "odds ratio" in printed
+    assert "velocity_drop" in printed
+    assert "usage + velocity" in printed
+
+
+def test_usage_model_report_skips_when_too_few_injuries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    labeled, usage = usage_report_inputs(players=20, arm_players=1)
+
+    cli._echo_usage_model(labeled, usage, 30)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_alerts_exits_nonzero_for_a_run_without_scores(output_dir: Path) -> None:
+    settings_path = fit_settings(output_dir)
+    params = model_params(jnp.zeros(6))
+    fit = FitResult(
+        params=params,
+        unconstrained=unconstrain(params),
+        unconstrained_cov=jnp.eye(12) * 1e-4,
+        log_likelihood=jnp.asarray(-100.0),
+        iterations=jnp.asarray(12),
+        gradient_norm=jnp.asarray(1e-9),
+    )
+    unscored = pl.DataFrame(
+        {
+            "player_id": [554430],
+            "game_date": [date(2026, 4, 1)],
+            "sample_size": [30],
+            "appearance_mean": [96.0],
+            "seasonal_effect": [0.0],
+            "filtered_mean": [96.0],
+            "filtered_sd": [0.3],
+            "smoothed_mean": [96.0],
+            "smoothed_sd": [0.2],
+        },
+        schema_overrides={"player_id": pl.Int32, "sample_size": pl.Int32},
+    )
+    with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
+        initialize_schema(connection)
+        spec = RunSpec("pitcher", "release_speed", "FF", (2026,))
+        save_run(connection, spec, fit, unscored)
 
     result = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
 

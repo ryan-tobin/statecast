@@ -16,6 +16,7 @@ GRIDLINE: Final = "#e1e0d9"
 AXIS_LINE: Final = "#c3c2b7"
 SERIES_BLUE: Final = "#2a78d6"
 SERIES_ORANGE: Final = "#eb6834"
+SERIES_AQUA: Final = "#1baf7a"
 
 FONT_FAMILY: Final = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
 

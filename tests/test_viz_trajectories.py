@@ -145,23 +145,23 @@ def test_season_span() -> None:
     assert season_span([2026, 2024]) == "2024-2026"
 
 
-def event_study_frame() -> pl.DataFrame:
+def relative_frame() -> pl.DataFrame:
     starts = list(range(-8, 0))
-    means = [
+    shifts = [
         *(-0.15 * (9 + k) for k in starts),
+        *(-0.05 for _ in starts),
         *(-0.01 * (9 + k) for k in starts),
-        0.01,
     ]
     return pl.DataFrame(
         {
-            "group": ["arm"] * 8 + ["other"] * 8 + ["healthy"],
-            "starts_before": [*starts, *starts, None],
-            "mean_z": means,
-            "lower_95": [mean - 0.2 for mean in means],
-            "upper_95": [mean + 0.2 for mean in means],
-            "appearances": [140] * 16 + [50_000],
+            "group": ["arm"] * 8 + ["trunk"] * 8 + ["lower_body"] * 8,
+            "starts_before": starts * 3,
+            "shift": shifts,
+            "lower_95": [shift - 0.2 for shift in shifts],
+            "upper_95": [shift + 0.2 for shift in shifts],
+            "placements": [140] * 8 + [90] * 8 + [60] * 8,
         },
-        schema_overrides={"starts_before": pl.Int32, "appearances": pl.UInt32},
+        schema_overrides={"starts_before": pl.Int32, "placements": pl.UInt32},
     )
 
 
@@ -169,21 +169,23 @@ def test_plot_event_study_saves_with_labels_inside(output_dir: Path) -> None:
     path = output_dir / "event_study.png"
 
     figure = plot_event_study(
-        event_study_frame(), "Velocity before injured-list stints", "Subtitle"
+        relative_frame(), "Velocity before injured-list stints", "Subtitle"
     )
     save_figure(figure, path)
 
     labels = [text.get_text() for text in figure.axes[0].texts]
-    assert "Arm injury (140)" in labels
+    assert {"Arm (140)", "Trunk (90)", "Lower body (60)", "Healthy games"} <= set(
+        labels
+    )
     assert path.stat().st_size > 10_000
     assert_text_inside(figure)
 
 
-def test_plot_event_study_rejects_empty_study() -> None:
-    empty = event_study_frame().filter(pl.col("group") == "healthy")
+def test_plot_event_study_rejects_a_study_with_no_charted_groups() -> None:
+    other_only = relative_frame().with_columns(group=pl.lit("other"))
 
     with pytest.raises(ValueError, match="no appearances"):
-        plot_event_study(empty, "Title", "Subtitle")
+        plot_event_study(other_only, "Title", "Subtitle")
 
 
 def test_spread_labels_separates_close_labels_and_keeps_order() -> None:

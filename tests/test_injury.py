@@ -58,11 +58,46 @@ def test_parse_placements_groups_arm_injuries() -> None:
     placements = parse_placements(transactions())
 
     assert placements["injury_group"].to_list() == [
-        "other",
+        "lower_body",
         "arm",
         "other",
         "arm",
         "arm",
+        "other",
+    ]
+
+
+def test_parse_placements_puts_each_injury_in_the_first_matching_group() -> None:
+    injuries = [
+        "Right thoracic outlet syndrome",
+        "Low back strain",
+        "Left oblique strain",
+        "Right hamstring strain",
+        "Left ankle sprain",
+        "Illness",
+        "Right middle finger blister",
+    ]
+    frame = pl.DataFrame(
+        {
+            "transaction_id": list(range(len(injuries))),
+            "player_id": list(range(len(injuries))),
+            "transaction_date": [date(2026, 5, 1)] * len(injuries),
+            "description": [
+                f"Team placed RHP X on the 15-day injured list. {injury}."
+                for injury in injuries
+            ],
+        }
+    )
+
+    groups = parse_placements(frame)["injury_group"].to_list()
+
+    assert groups == [
+        "arm",
+        "trunk",
+        "trunk",
+        "lower_body",
+        "lower_body",
+        "other",
         "other",
     ]
 
