@@ -32,6 +32,8 @@ PARAMETER_NAMES = (
     *(f"season_{name}" for name in FREE_KNOT_NAMES),
 )
 LOG_SCALE = (True, True, True, False, True, True, *([False] * FREE_KNOT_COUNT))
+MEAN_INDEX = PARAMETER_NAMES.index("population_mean")
+KNOT_SLICE = slice(6, 6 + FREE_KNOT_COUNT)
 
 
 class FitResult(NamedTuple):
@@ -94,6 +96,33 @@ def initial_guess(batch: ObservationBatch) -> PopulationParams:
     )
 
 
+def optimizer_coordinates(batch: ObservationBatch) -> tuple[Array, Array]:
+    """Shift and scale that put the mean and seasonal knots in pooled-sd units.
+
+    The optimizer works on ``(raw - shift) / scale``. Log-scale parameters are
+    left alone, since a change of units only shifts them; the population mean
+    and the knots are centered on the pooled mean and divided by the pooled
+    per-pitch sd. The likelihood is unchanged, but L-BFGS then follows the
+    same path whatever the units, so rpm and degrees converge as fast as mph.
+
+    Args:
+        batch: Padded appearances.
+
+    Returns:
+        ``(shift, scale)``, each the length of the unconstrained vector.
+    """
+    weights = jnp.where(batch.mask, batch.sample_size, 0.0)
+    total = jnp.sum(weights)
+    center = jnp.sum(weights * batch.mean) / total
+    within = jnp.sum(jnp.where(batch.mask, batch.within_ss, 0.0))
+    between = jnp.sum(weights * (batch.mean - center) ** 2)
+    spread = jnp.sqrt((within + between) / total)
+    size = len(PARAMETER_NAMES)
+    shift = jnp.zeros(size).at[MEAN_INDEX].set(center)
+    scale = jnp.ones(size).at[MEAN_INDEX].set(spread).at[KNOT_SLICE].set(spread)
+    return shift, scale
+
+
 def fit_population(
     batch: ObservationBatch,
     initial: PopulationParams,
@@ -103,33 +132,40 @@ def fit_population(
     """Maximize the population log-likelihood over the unconstrained parameters.
 
     The objective is the negative log-likelihood per pitch, so the gradient
-    tolerance does not depend on how much data is in the batch. The covariance
-    is the inverse Hessian of the total negative log-likelihood at the optimum.
+    tolerance does not depend on how much data is in the batch. L-BFGS runs in
+    the unit-free coordinates of ``optimizer_coordinates``. The covariance is
+    the inverse Hessian of the total negative log-likelihood at the optimum,
+    on the usual unconstrained scale.
 
     Args:
         batch: Padded appearances.
         initial: Starting parameters, usually from ``initial_guess``.
         max_iterations: L-BFGS iteration cap.
-        tolerance: Stop when the gradient norm falls below this.
+        tolerance: Stop when the gradient norm (in optimizer coordinates)
+            falls below this.
 
     Returns:
         Estimates, their covariance and convergence diagnostics.
     """
     total_count = jnp.sum(jnp.where(batch.mask, batch.sample_size, 0.0))
+    shift, scale = optimizer_coordinates(batch)
 
     def objective(raw: Array) -> Array:
         return -population_log_likelihood(constrain(raw), batch) / total_count
 
+    def scaled_objective(point: Array) -> Array:
+        return objective(shift + scale * point)
+
     solver = optax.lbfgs()
-    value_and_grad = optax.value_and_grad_from_state(objective)
+    value_and_grad = optax.value_and_grad_from_state(scaled_objective)
 
     def step(carry: tuple[Array, optax.OptState]) -> tuple[Array, optax.OptState]:
-        raw, state = carry
-        value, grad = value_and_grad(raw, state=state)
+        point, state = carry
+        value, grad = value_and_grad(point, state=state)
         updates, state = solver.update(
-            grad, state, raw, value=value, grad=grad, value_fn=objective
+            grad, state, point, value=value, grad=grad, value_fn=scaled_objective
         )
-        return optax.apply_updates(raw, updates), state
+        return optax.apply_updates(point, updates), state
 
     def keep_going(carry: tuple[Array, optax.OptState]) -> Array:
         _, state = carry
@@ -139,8 +175,9 @@ def fit_population(
             (iteration < max_iterations) & (gradient_norm >= tolerance)
         )
 
-    start = unconstrain(initial)
-    raw, state = jax.lax.while_loop(keep_going, step, (start, solver.init(start)))
+    start = (unconstrain(initial) - shift) / scale
+    point, state = jax.lax.while_loop(keep_going, step, (start, solver.init(start)))
+    raw = shift + scale * point
     hessian = jax.hessian(objective)(raw) * total_count
     return FitResult(
         params=constrain(raw),
@@ -181,7 +218,8 @@ def summarize_fit(fit: FitResult) -> pl.DataFrame:
     standard_errors = np.concatenate([np.sqrt(np.diag(cov)), derived_se])
     log_scale = np.array([*LOG_SCALE, True, True])
     bounds = centers[:, None] + np.array([0.0, -Z_95, Z_95]) * standard_errors[:, None]
-    values = np.where(log_scale[:, None], np.exp(bounds), bounds)
+    values = bounds.copy()
+    values[log_scale] = np.exp(bounds[log_scale])
     return pl.DataFrame(
         {
             "parameter": [*PARAMETER_NAMES, "half_life_days", "stationary_sd"],
