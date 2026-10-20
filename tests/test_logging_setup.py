@@ -19,6 +19,7 @@ def test_configure_logging_sets_level_and_format() -> None:
         root_logger.handlers[:] = original_handlers
         root_logger.setLevel(original_level)
 
+
 def test_configure_logging_quiets_http_client_logs() -> None:
     root_logger = logging.getLogger()
     original_handlers = root_logger.handlers[:]

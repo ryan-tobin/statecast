@@ -1,6 +1,9 @@
 from datetime import date
 from pathlib import Path
 
+import duckdb
+import jax.numpy as jnp
+import polars as pl
 import pytest
 from typer.testing import CliRunner
 
@@ -8,6 +11,8 @@ from statecast import cli
 from statecast.config import Settings
 from statecast.ingest.pipeline import IngestSummary
 from statecast.ingest.savant import StatcastIngestSummary
+from statecast.models.estimation import FitResult
+from statecast.models.kalman import ObservationBatch, PopulationParams, unconstrain
 
 PROJECT_SETTINGS = Path(__file__).parent.parent / "config" / "settings.toml"
 runner = CliRunner()
@@ -116,6 +121,84 @@ def test_load_passes_requested_seasons(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_missing_settings_file_exits_nonzero(output_dir: Path) -> None:
     result = runner.invoke(
         cli.app, ["load", "--settings", str(output_dir / "missing.toml")]
+    )
+
+    assert result.exit_code == 1
+
+
+def fit_settings(output_dir: Path) -> Path:
+    settings_path = output_dir / "config" / "settings.toml"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        PROJECT_SETTINGS.read_text(encoding="utf-8").replace(
+            "data/warehouse/statecast.duckdb", "warehouse.duckdb"
+        ),
+        encoding="utf-8",
+    )
+    duckdb.connect(str(output_dir / "warehouse.duckdb")).close()
+    return settings_path
+
+
+def test_fit_prints_parameter_table(
+    output_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = (0.02, 0.05, 1.0, 94.0, 1.5, 0.5)
+    params = PopulationParams(*(jnp.asarray(v) for v in values))
+    frame = pl.DataFrame(
+        {
+            "player_id": [1, 1],
+            "game_date": [date(2026, 4, 1), date(2026, 4, 6)],
+            "sample_size": [90, 88],
+            "mean": [94.0, 94.2],
+            "within_ss": [80.0, 85.0],
+        }
+    )
+
+    def fake_fit(batch: ObservationBatch, initial: PopulationParams) -> FitResult:
+        return FitResult(
+            params=params,
+            unconstrained=unconstrain(params),
+            unconstrained_cov=jnp.eye(6) * 1e-4,
+            log_likelihood=jnp.asarray(-100.0),
+            iterations=jnp.asarray(12),
+            gradient_norm=jnp.asarray(1e-9),
+        )
+
+    monkeypatch.setattr(cli, "pitcher_appearances", lambda *args: frame)
+    monkeypatch.setattr(cli, "fit_population", fake_fit)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "fit",
+            "pitcher",
+            "--season",
+            "2026",
+            "--settings",
+            str(fit_settings(output_dir)),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "half_life_days" in result.output
+    assert "day_effect_sd" in result.output
+
+
+def test_fit_exits_nonzero_without_data(
+    output_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "hitter_appearances", lambda *args: pl.DataFrame())
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "fit",
+            "hitter",
+            "--season",
+            "2026",
+            "--settings",
+            str(fit_settings(output_dir)),
+        ],
     )
 
     assert result.exit_code == 1
