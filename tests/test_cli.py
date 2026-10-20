@@ -318,9 +318,16 @@ def test_trajectory_then_chart_end_to_end(
     alerted = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
 
     assert alerted.exit_code == 0, alerted.output
-    assert "AUC against healthy games" in alerted.output
-    assert "End-of-season alerts" in alerted.output
+    assert "Velocity (drop): AUC against healthy games" in alerted.output
+    assert "end-of-season alerts" in alerted.output
     assert (figures / "il_event_study_ff_release_speed.png").exists()
+
+    scanned = runner.invoke(cli.app, ["scan", "--settings", str(settings_path)])
+
+    assert scanned.exit_code == 0, scanned.output
+    assert "release_speed" in scanned.output
+    assert "spin_rate" not in scanned.output
+    assert (figures / "metric_scan_ff.png").exists()
 
 
 def test_alerts_exits_nonzero_without_a_run(output_dir: Path) -> None:
@@ -329,6 +336,16 @@ def test_alerts_exits_nonzero_without_a_run(output_dir: Path) -> None:
         initialize_schema(connection)
 
     result = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
+
+    assert result.exit_code == 1
+
+
+def test_scan_exits_nonzero_without_runs(output_dir: Path) -> None:
+    settings_path = fit_settings(output_dir)
+    with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
+        initialize_schema(connection)
+
+    result = runner.invoke(cli.app, ["scan", "--settings", str(settings_path)])
 
     assert result.exit_code == 1
 
@@ -358,7 +375,7 @@ def usage_report_inputs(players: int, arm_players: int) -> tuple[pl.DataFrame, .
         {
             "player_id": player_id,
             "game_date": game_date,
-            "alert_z": rng.normal(size=player_id.size) - 1.5 * injured,
+            "score": rng.normal(size=player_id.size) + 1.5 * injured,
             "injured": injured,
             "is_final": np.zeros(player_id.size, dtype=bool),
         }
@@ -384,8 +401,8 @@ def test_usage_model_report_prints_odds_ratios_and_cv_auc(
 
     printed = capsys.readouterr().out
     assert "odds ratio" in printed
-    assert "velocity_drop" in printed
-    assert "usage + velocity" in printed
+    assert "signal" in printed
+    assert "usage + signal" in printed
 
 
 def test_usage_model_report_skips_when_too_few_injuries(

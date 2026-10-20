@@ -55,14 +55,14 @@ def test_relative_usage_treats_identical_history_as_no_spread() -> None:
 
 
 def logistic_data(seed: int, players: int = 400) -> pl.DataFrame:
-    """Games where workload and a velocity drop both raise injury odds."""
+    """Games where workload and an alert signal both raise injury odds."""
     rng = np.random.default_rng(seed)
     games = 40
     cluster = np.repeat(np.arange(players), games)
     pitches_z = rng.normal(size=cluster.size)
     rest_z = rng.normal(size=cluster.size)
-    velocity_drop = rng.normal(size=cluster.size) + rng.normal(size=players)[cluster]
-    logit = -3.0 - 0.3 * pitches_z + 0.2 * rest_z + 0.6 * velocity_drop
+    signal = rng.normal(size=cluster.size) + rng.normal(size=players)[cluster]
+    logit = -3.0 - 0.3 * pitches_z + 0.2 * rest_z + 0.6 * signal
     positive = rng.random(cluster.size) < 1.0 / (1.0 + np.exp(-logit))
     return pl.DataFrame(
         {
@@ -71,7 +71,7 @@ def logistic_data(seed: int, players: int = 400) -> pl.DataFrame:
             "positive": positive,
             "pitches_z": pitches_z,
             "rest_z": rest_z,
-            "velocity_drop": velocity_drop,
+            "signal": signal,
         }
     )
 
@@ -80,9 +80,9 @@ def test_coefficient_table_recovers_true_odds_ratios() -> None:
     table = coefficient_table(logistic_data(seed=1))
 
     rows = {row["term"]: row for row in table.iter_rows(named=True)}
-    for term, truth in (("pitches_z", -0.3), ("rest_z", 0.2), ("velocity_drop", 0.6)):
+    for term, truth in (("pitches_z", -0.3), ("rest_z", 0.2), ("signal", 0.6)):
         assert rows[term]["lower_95"] < np.exp(truth) < rows[term]["upper_95"]
-    assert rows["velocity_drop"]["odds_ratio"] > 1.5
+    assert rows["signal"]["odds_ratio"] > 1.5
 
 
 def test_cluster_robust_covariance_ignores_duplicated_rows() -> None:
@@ -107,7 +107,7 @@ def test_cross_validated_auc_rewards_the_informative_feature() -> None:
     table = cross_validated_auc(logistic_data(seed=3))
 
     auc = dict(table.iter_rows())
-    assert auc["usage + velocity"] > auc["usage"] + 0.05
+    assert auc["usage + signal"] > auc["usage"] + 0.05
     assert 0.5 < auc["usage"] < 0.7
 
 
@@ -116,7 +116,7 @@ def test_model_sample_joins_usage_and_drops_incomplete_games() -> None:
         {
             "player_id": [5, 5, 6],
             "game_date": [date(2026, 5, 1), date(2026, 5, 6), date(2026, 5, 2)],
-            "alert_z": [-1.5, 0.5, 0.2],
+            "score": [1.5, -0.5, -0.2],
             "positive": [True, False, False],
         }
     )
@@ -131,7 +131,7 @@ def test_model_sample_joins_usage_and_drops_incomplete_games() -> None:
 
     sample = model_sample(labeled, usage)
 
-    assert sample["velocity_drop"].to_list() == [1.5, -0.2]
+    assert sample["signal"].to_list() == [1.5, -0.2]
     assert sample["cluster"].to_list() == [0, 1]
 
 

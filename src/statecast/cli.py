@@ -1,4 +1,4 @@
-"""Command-line interface: ingest, load, fit, trajectory, chart and alerts."""
+"""Command-line interface: ingest, load, fit, trajectory, chart, alerts and scan."""
 
 import asyncio
 import logging
@@ -16,6 +16,8 @@ from statecast.config import DEFAULT_SETTINGS_PATH, Settings, load_settings
 from statecast.evaluation.injury_alerts import (
     PLACEBO_GROUP,
     TARGET_GROUP,
+    Direction,
+    alert_score,
     auc_table,
     current_alerts,
     event_study,
@@ -25,6 +27,7 @@ from statecast.evaluation.injury_alerts import (
     relative_to_healthy,
     threshold_table,
 )
+from statecast.evaluation.metric_scan import METRIC_DIRECTIONS, metric_scan
 from statecast.evaluation.usage_model import (
     coefficient_table,
     cross_validated_auc,
@@ -56,6 +59,7 @@ from statecast.storage.model_runs import (
 )
 from statecast.storage.warehouse import build_warehouse
 from statecast.viz.injury_alerts import plot_event_study
+from statecast.viz.metric_scan import metric_label, plot_metric_scan
 from statecast.viz.seasonal import plot_seasonal_curve
 from statecast.viz.trajectories import (
     chart_labels,
@@ -66,7 +70,9 @@ from statecast.viz.trajectories import (
 )
 
 logger = logging.getLogger(__name__)
+
 ALERT_THRESHOLDS: Final = (1.0, 1.5, 2.0, 2.5, 3.0)
+CURRENT_ALERT_THRESHOLD: Final = 2.0
 MIN_MODEL_POSITIVES: Final = 20
 
 app = typer.Typer(help="statecast data pipeline.", no_args_is_help=True)
@@ -83,8 +89,13 @@ PitchTypeOption = Annotated[str, typer.Option(help="Pitch type (pitchers).")]
 HorizonOption = Annotated[
     int, typer.Option(help="Days after a game that count as before an IL stint.")
 ]
-ThresholdOption = Annotated[
-    float, typer.Option(help="Alert when talent is this many sd below level.")
+PitcherMetricOption = Annotated[
+    str,
+    typer.Option(help="release_speed, spin_rate, release_extension or arm_angle."),
+]
+DirectionOption = Annotated[
+    Direction | None,
+    typer.Option(help="drop, rise or either; the metric's default when omitted."),
 ]
 AnyPitchTypeOption = Annotated[
     str | None, typer.Option(help="Pitch type, such as FF; any when omitted.")
@@ -204,12 +215,12 @@ def _load_and_fit(
 
 
 def _echo_table(table: pl.DataFrame) -> None:
-    """Print a table in full; Polars hides middle rows past ten by default.
+    """Print a table in full; Polars hides middle rows and columns by default.
 
     Args:
         table: Table to print.
     """
-    with pl.Config(tbl_rows=-1):
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=200):
         typer.echo(table)
 
 
@@ -356,7 +367,7 @@ class AlertInputs(NamedTuple):
 
     Attributes:
         run: The scored run.
-        states: Real-time alert scores per appearance.
+        states: Real-time alert z-scores per appearance.
         placements: Every IL placement.
         usage: Real-time workload scores per appearance.
     """
@@ -396,10 +407,10 @@ def _load_alert_inputs(warehouse_path: Path, spec: RunSpec) -> AlertInputs:
 
 
 def _echo_usage_model(labeled: pl.DataFrame, usage: pl.DataFrame, horizon: int) -> None:
-    """Print whether velocity adds to workload, if there is enough data.
+    """Print whether the metric's alert adds to workload, if there is enough data.
 
     Args:
-        labeled: Output of ``label_appearances``.
+        labeled: Output of ``label_appearances`` with a ``score`` column.
         usage: Output of ``relative_usage``.
         horizon: Days before a placement that count.
     """
@@ -421,52 +432,59 @@ def _echo_usage_model(labeled: pl.DataFrame, usage: pl.DataFrame, horizon: int) 
 @app.command()
 def alerts(
     pitch_type: PitchTypeOption = "FF",
+    metric: PitcherMetricOption = "release_speed",
+    direction: DirectionOption = None,
     horizon_days: HorizonOption = 30,
-    threshold: ThresholdOption = 2.0,
     settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
 ) -> None:
-    """Test whether real-time velocity drops come before IL placements.
+    """Test whether real-time changes in one metric come before IL placements.
 
-    Uses the latest pitcher velocity run for the pitch type. Prints the
+    Uses the latest pitcher run for the metric and pitch type. Prints the
     warning-game threshold table, AUCs by injury group and phase with
     pitcher-bootstrap intervals, the arm-minus-lower-body contrast, whether
-    velocity adds to workload, and end-of-season alerts with what came next,
+    the alert adds to workload, and end-of-season alerts with what came next,
     then draws the event-study chart.
 
     Args:
         pitch_type: Pitch type of the run to score, such as ``FF``.
+        metric: Pitcher metric of the run, such as ``spin_rate``.
+        direction: Which way the metric must move to be alarming; defaults to
+            the metric's entry in ``METRIC_DIRECTIONS``.
         horizon_days: Days after a game that count as before an IL stint.
-        threshold: Alert threshold for the end-of-season table.
         settings_path: Path to ``settings.toml``.
 
     Raises:
         typer.Exit: With code 1 if no run has alert scores.
     """
     settings = _load_or_exit(settings_path)
-    spec = RunSpec(Role.PITCHER, "release_speed", pitch_type, ())
+    direction = direction or METRIC_DIRECTIONS.get(metric, Direction.DROP)
+    spec = RunSpec(Role.PITCHER, metric, pitch_type, ())
     inputs = _load_alert_inputs(settings.paths.warehouse_path, spec)
-    labeled = label_appearances(inputs.states, inputs.placements)
+    scored = inputs.states.with_columns(alert_score(direction))
+    labeled = label_appearances(scored, inputs.placements)
     study = event_study(labeled)
+    label = metric_label(metric, direction)
     _echo_section(
-        f"Warning games before arm IL stints within {horizon_days} days",
+        f"{label}: warning games before arm IL stints within {horizon_days} days",
         threshold_table(labeled, ALERT_THRESHOLDS, horizon_days),
     )
     _echo_section(
-        "AUC against healthy games (95% pitcher-bootstrap intervals)",
+        f"{label}: AUC against healthy games (95% pitcher-bootstrap intervals)",
         auc_table(labeled, horizon_days),
     )
     _echo_section(
-        f"Mean alert score, {TARGET_GROUP} minus {PLACEBO_GROUP}, by appearance",
+        f"{label}: mean score, {TARGET_GROUP} minus {PLACEBO_GROUP}, by appearance",
         group_contrast(study, TARGET_GROUP, PLACEBO_GROUP),
     )
     _echo_usage_model(labeled, inputs.usage, horizon_days)
     _echo_section(
-        f"End-of-season alerts at or below -{threshold} sd, and what came next",
-        current_alerts(inputs.states, inputs.placements, threshold),
+        f"{label}: end-of-season alerts at {CURRENT_ALERT_THRESHOLD} sd or more, "
+        "and what came next",
+        current_alerts(scored, inputs.placements, CURRENT_ALERT_THRESHOLD),
     )
     seasons = sorted(set(inputs.states["game_date"].dt.year().to_list()))
     pitch_name = (inputs.run.pitch_name or pitch_type).lower()
-    title = f"Velocity before injured-list stints, {pitch_name}"
+    title = f"{label} before injured-list stints, {pitch_name}"
     subtitle = (
         f"Mean real-time alert score by appearance relative to healthy games, "
         f"{season_span(seasons)} regular season"
@@ -477,8 +495,105 @@ def alerts(
         logger.error("No event-study chart: %s", error)
         raise typer.Exit(code=1) from error
     output = settings.paths.figures_dir / figure_filename(
-        "il event study", spec.metric, pitch_type
+        "il event study", metric, pitch_type
     )
+    save_figure(figure, output)
+    typer.echo(output)
+
+
+class ScanResult(NamedTuple):
+    """One metric's AUC table and the seasons it covers.
+
+    Attributes:
+        aucs: Output of ``auc_table``.
+        seasons: Seasons in the run.
+    """
+
+    aucs: pl.DataFrame
+    seasons: list[int]
+
+
+def _scan_metric(
+    connection: duckdb.DuckDBPyConnection,
+    spec: RunSpec,
+    direction: Direction,
+    placements: pl.DataFrame,
+    horizon_days: int,
+) -> ScanResult | None:
+    """Score one metric's latest run against IL placements.
+
+    Args:
+        connection: Warehouse connection.
+        spec: Role, metric and pitch type of the run.
+        direction: Which way the metric must move to be alarming.
+        placements: Output of ``il_placements``.
+        horizon_days: Days before a placement that count.
+
+    Returns:
+        The metric's AUC table, or ``None`` if it has no scored run.
+    """
+    try:
+        run = latest_run(connection, spec)
+    except LookupError:
+        logger.warning("No %s run of %s; skipping", spec.pitch_type, spec.metric)
+        return None
+    states = load_alert_states(connection, run.run_id)
+    if states.is_empty():
+        logger.warning("Run of %s has no alert scores; skipping", spec.metric)
+        return None
+    scored = states.with_columns(alert_score(direction))
+    labeled = label_appearances(scored, placements)
+    seasons = sorted(set(states["game_date"].dt.year().to_list()))
+    return ScanResult(auc_table(labeled, horizon_days), seasons)
+
+
+@app.command()
+def scan(
+    pitch_type: PitchTypeOption = "FF",
+    horizon_days: HorizonOption = 30,
+    settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
+) -> None:
+    """Ask which metrics warn of arm injuries more than of lower-body ones.
+
+    Scores the latest run of every metric in ``METRIC_DIRECTIONS`` for the
+    pitch type, prints the arm-minus-lower-body AUC difference per metric and
+    phase with Holm-adjusted p-values, and draws the forest chart. Metrics
+    without a stored run are skipped.
+
+    Args:
+        pitch_type: Pitch type of the runs, such as ``FF``.
+        horizon_days: Days after a game that count as before an IL stint.
+        settings_path: Path to ``settings.toml``.
+
+    Raises:
+        typer.Exit: With code 1 if no metric has a scored run.
+    """
+    settings = _load_or_exit(settings_path)
+    results: dict[tuple[str, Direction], pl.DataFrame] = {}
+    seasons: set[int] = set()
+    with duckdb.connect(str(settings.paths.warehouse_path), read_only=True) as con:
+        placements = il_placements(con)
+        pitch_name = (pitch_type_name(con, pitch_type) or pitch_type).lower()
+        for metric, direction in METRIC_DIRECTIONS.items():
+            spec = RunSpec(Role.PITCHER, metric, pitch_type, ())
+            result = _scan_metric(con, spec, direction, placements, horizon_days)
+            if result is not None:
+                results[metric, direction] = result.aucs
+                seasons.update(result.seasons)
+    if not results:
+        logger.error("No scored %s runs; run `statecast trajectory` first", pitch_type)
+        raise typer.Exit(code=1)
+    table = metric_scan(results)
+    _echo_section(
+        "Arm minus lower-body AUC by metric (p-values Holm-adjusted across the scan)",
+        table,
+    )
+    subtitle = (
+        f"{pitch_name.capitalize()}, {season_span(sorted(seasons))} regular season, "
+        f"IL placement within {horizon_days} days"
+    )
+    output = settings.paths.figures_dir / figure_filename("metric scan", "", pitch_type)
+    figure = plot_metric_scan(table, "Which metrics warn of arm injuries?", subtitle)
     save_figure(figure, output)
     typer.echo(output)
 

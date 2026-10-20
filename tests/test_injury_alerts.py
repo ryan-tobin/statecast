@@ -7,7 +7,10 @@ import polars as pl
 import pytest
 
 from statecast.evaluation.injury_alerts import (
+    Direction,
+    alert_score,
     auc_table,
+    bootstrap_summary,
     current_alerts,
     event_study,
     group_contrast,
@@ -23,7 +26,7 @@ from statecast.models.trajectory import smooth_population, trajectory_frame
 
 
 def states(rows: list[tuple[int, date, float]]) -> pl.DataFrame:
-    """Appearances with a chosen alert score."""
+    """Appearances with a chosen alert z, scored as a drop."""
     return pl.DataFrame(
         {
             "player_id": [row[0] for row in rows],
@@ -33,7 +36,7 @@ def states(rows: list[tuple[int, date, float]]) -> pl.DataFrame:
             "filtered_gap_mean": [0.5 * row[2] for row in rows],
             "alert_z": [row[2] for row in rows],
         }
-    )
+    ).with_columns(alert_score(Direction.DROP))
 
 
 def placements(rows: list[tuple[int, date, str]]) -> pl.DataFrame:
@@ -66,6 +69,33 @@ STINTS = placements(
         (2, date(2025, 5, 7), "arm"),
     ]
 )
+
+
+def test_alert_score_signs_each_direction() -> None:
+    frame = pl.DataFrame({"alert_z": [-2.0, 0.5]})
+
+    scores = {
+        direction: frame.select(alert_score(direction))["score"].to_list()
+        for direction in Direction
+    }
+
+    assert scores == {
+        Direction.DROP: [2.0, -0.5],
+        Direction.RISE: [-2.0, 0.5],
+        Direction.EITHER: [2.0, 0.5],
+    }
+
+
+def test_bootstrap_summary_interval_and_two_sided_p_value() -> None:
+    draws = np.concatenate([np.linspace(-0.1, 0.3, 95), [np.nan] * 5])
+
+    low, high, p_value = bootstrap_summary(draws, 0.0)
+
+    below = (np.sum(draws[:95] <= 0.0) + 1) / 96
+    assert low == pytest.approx(np.percentile(draws[:95], 2.5))
+    assert high == pytest.approx(np.percentile(draws[:95], 97.5))
+    assert p_value == pytest.approx(2 * below)
+    assert all(np.isnan(bootstrap_summary(np.array([np.nan]), 0.0)))
 
 
 def test_label_appearances_finds_next_placement_and_final_game() -> None:
@@ -125,6 +155,7 @@ def test_auc_table_point_estimates_and_target_minus_placebo() -> None:
     difference = rows["arm - lower_body", "detection"]
     assert difference["auc"] == pytest.approx(4 / 6 - 1 / 3)
     assert difference["placements"] is None
+    assert 0.0 < difference["p_value"] <= 1.0
 
 
 def test_threshold_table_scores_warning_games_against_healthy_ones() -> None:
@@ -149,10 +180,10 @@ def test_event_study_relative_shift_and_contrast() -> None:
     relative = relative_to_healthy(study)
     contrast = group_contrast(study, "arm", "lower_body")
 
-    healthy_mean = (-2.2 - 2.1 + 0.3) / 3
+    healthy_mean = (2.2 + 2.1 - 0.3) / 3
     arm = relative.filter(pl.col("group") == "arm").sort("starts_before")
     np.testing.assert_allclose(
-        arm["shift"], [-1.2 - healthy_mean, (-2.6 + 0.1) / 2 - healthy_mean]
+        arm["shift"], [1.2 - healthy_mean, (2.6 - 0.1) / 2 - healthy_mean]
     )
     last = arm.row(-1, named=True)
     healthy_se = np.std([-2.2, -2.1, 0.3], ddof=1) / np.sqrt(3)
@@ -160,7 +191,7 @@ def test_event_study_relative_shift_and_contrast() -> None:
     half_width = 1.959963984540054 * np.hypot(healthy_se, arm_se)
     assert last["upper_95"] - last["shift"] == pytest.approx(half_width)
     assert contrast["starts_before"].to_list() == [-1]
-    assert contrast["difference"][0] == pytest.approx(-1.25 + 0.4)
+    assert contrast["difference"][0] == pytest.approx(1.25 - 0.4)
 
 
 def test_relative_to_healthy_requires_a_baseline() -> None:
@@ -240,10 +271,10 @@ def simulated_injuries() -> tuple[pl.DataFrame, pl.DataFrame]:
 @pytest.fixture(scope="module")
 def simulated_labels() -> pl.DataFrame:
     paths, stints = simulated_injuries()
-    return label_appearances(paths, stints)
+    return label_appearances(paths.with_columns(alert_score(Direction.DROP)), stints)
 
 
-def test_simulated_fade_shifts_arm_scores_below_healthy_only(
+def test_simulated_fade_raises_arm_scores_above_healthy_only(
     simulated_labels: pl.DataFrame,
 ) -> None:
     study = event_study(simulated_labels, max_starts=8)
@@ -253,10 +284,10 @@ def test_simulated_fade_shifts_arm_scores_below_healthy_only(
 
     arm = relative.filter(pl.col("group") == "arm").sort("starts_before")
     placebo = relative.filter(pl.col("group") == "lower_body").sort("starts_before")
-    assert float(arm["shift"][0]) > -0.3
-    assert float(arm["upper_95"][-1]) < -1.0
+    assert float(arm["shift"][0]) < 0.3
+    assert float(arm["lower_95"][-1]) > 1.0
     assert float(placebo["lower_95"][-1]) < 0.0 < float(placebo["upper_95"][-1])
-    assert float(contrast["upper_95"][-1]) < 0.0
+    assert float(contrast["lower_95"][-1]) > 0.0
 
 
 def test_simulated_auc_is_higher_at_detection_than_warning(

@@ -21,8 +21,8 @@ GROUP_STYLES: Final[dict[str, tuple[str, str]]] = {
     "lower_body": (theme.SERIES_BLUE, "Lower body"),
 }
 FOOTNOTE: Final = (
-    "Alert score: real-time talent minus the pitcher's own level, from games "
-    "already pitched, scaled to be N(0, 1) when nothing is wrong.\n"
+    "Alert score: real-time talent vs the pitcher's own level from games already "
+    "pitched, N(0, 1) when nothing is wrong, signed so higher is more alarming.\n"
     "Shown as the difference from healthy games (no IL stint within 60 days). "
     "Bands are 95% intervals; counts are IL placements."
 )
@@ -139,7 +139,7 @@ def _style_axes(axes: Axes, first: int) -> None:
     axes.set_xticklabels(["Final" if k == -1 else str(k) for k in range(first, 0)])
     axes.set_xlim(first - 0.4, -0.6)
     axes.set_xlabel("Appearances before the IL placement")
-    axes.set_ylabel("Alert score minus healthy games (sd)")
+    axes.set_ylabel("Alert score above healthy games (sd)")
     axes.grid(axis="y")
     axes.set_axisbelow(True)
     for side in ("top", "right", "left"):

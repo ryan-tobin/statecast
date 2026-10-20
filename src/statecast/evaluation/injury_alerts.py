@@ -1,15 +1,18 @@
-"""Do real-time velocity drops come before injured-list placements?
+"""Do real-time changes in a pitch metric come before injured-list placements?
 
-Each appearance carries a real-time alert score (``alert_z``, from
-``models.trajectory.gap_scores``): how far the pitcher's current talent sits
-below his own long-run level, using only games already pitched, scaled so it is
-exactly standard normal for a pitcher whose talent follows the model.
+Each appearance carries a real-time alert z-score (``alert_z``, from
+``models.trajectory.gap_scores``): how far the pitcher's current talent in one
+metric sits from his own long-run level, using only games already pitched,
+scaled so it is exactly standard normal for a pitcher whose talent follows the
+model. A ``Direction`` turns it into a ``score`` where higher is always more
+alarming: a ``drop`` (velocity, spin, extension), a ``rise``, or ``either``
+(arm angle, which can drift up or down).
 
 Appearances are labeled by the pitcher's next IL placement and split into two
 phases. The *detection* game is the last appearance before a placement, often
 the game the injury happened in. *Warning* games are the earlier ones, the only
 ones an alert could act on. Arm injuries are the target; lower-body injuries
-are the placebo, since a hamstring strain gives velocity no reason to fall
+are the placebo, since a hamstring strain gives the arm no reason to change
 beforehand. Trunk injuries (back, oblique, ribs) sit in between, because they
 change a pitcher's delivery.
 
@@ -19,6 +22,7 @@ appearances (no placement in the lookback window), not against zero.
 """
 
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import Final
 
 import numpy as np
@@ -38,7 +42,36 @@ AUC_TABLE_SCHEMA: Final = {
     "auc": pl.Float64,
     "lower_95": pl.Float64,
     "upper_95": pl.Float64,
+    "p_value": pl.Float64,
 }
+
+
+class Direction(StrEnum):
+    """Which way a metric has to move to be alarming."""
+
+    DROP = "drop"
+    RISE = "rise"
+    EITHER = "either"
+
+
+def alert_score(direction: Direction) -> pl.Expr:
+    """Turn ``alert_z`` into a score where higher is more alarming.
+
+    Args:
+        direction: ``drop`` scores ``-alert_z``, ``rise`` scores ``alert_z``
+            and ``either`` scores ``|alert_z|``.
+
+    Returns:
+        An expression named ``score``.
+
+    Example:
+        >>> frame = pl.DataFrame({"alert_z": [-2.0, 1.5]})
+        >>> frame.select(alert_score(Direction.EITHER))["score"].to_list()
+        [2.0, 1.5]
+    """
+    z = pl.col("alert_z")
+    scores = {Direction.DROP: -z, Direction.RISE: z, Direction.EITHER: z.abs()}
+    return scores[direction].alias("score")
 
 
 def label_appearances(states: pl.DataFrame, placements: pl.DataFrame) -> pl.DataFrame:
@@ -140,39 +173,57 @@ def _binned_auc(
     return float(wins / (total_positive * total_negative))
 
 
-def _auc_row(
-    group: str, phase: str, placements: int | None, estimate: float, draws: np.ndarray
-) -> tuple[str, str, int | None, float, float, float]:
-    """One AUC table row with a percentile interval from bootstrap draws."""
+def bootstrap_summary(draws: np.ndarray, null: float) -> tuple[float, float, float]:
+    """Percentile interval and two-sided p-value from bootstrap draws.
+
+    The p-value is twice the smaller share of draws on either side of the
+    null value, with one pseudo-draw added to each side so it is never zero.
+
+    Args:
+        draws: Bootstrap replicates of a statistic (NaNs are ignored).
+        null: Value under the null hypothesis, such as 0.5 for an AUC.
+
+    Returns:
+        ``(lower_95, upper_95, p_value)``, all NaN if no draw is finite.
+
+    Example:
+        >>> low, high, p = bootstrap_summary(np.linspace(0.55, 0.65, 99), 0.5)
+        >>> round(p, 3)
+        0.02
+    """
     finite = draws[np.isfinite(draws)]
     if finite.size == 0:
-        return group, phase, placements, estimate, float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     low, high = np.percentile(finite, [2.5, 97.5])
-    return group, phase, placements, estimate, float(low), float(high)
+    below = (np.sum(finite <= null) + 1) / (finite.size + 1)
+    above = (np.sum(finite >= null) + 1) / (finite.size + 1)
+    return float(low), float(high), float(min(1.0, 2.0 * min(below, above)))
 
 
 def auc_table(
     labeled: pl.DataFrame, horizon_days: int, reps: int = BOOTSTRAP_REPS, seed: int = 0
 ) -> pl.DataFrame:
-    """AUC of a velocity drop for every injury group and phase, with intervals.
+    """AUC of the alert score for every injury group and phase, with intervals.
 
     Each AUC compares games before a placement (positives) with healthy games
-    (negatives), scoring ``-alert_z``. Intervals come from a pitcher-cluster
-    bootstrap: whole pitchers are resampled, because games of one pitcher are
-    correlated. Every group is scored on the same resamples, so the
-    ``arm - lower_body`` rows (target minus placebo) get paired intervals.
+    (negatives), ranking by ``score``. Intervals and p-values come from a
+    pitcher-cluster bootstrap: whole pitchers are resampled, because games of
+    one pitcher are correlated. Every group is scored on the same resamples,
+    so the ``arm - lower_body`` rows (target minus placebo) get paired
+    intervals. Group rows test AUC = 0.5; difference rows test a difference
+    of 0.
 
     Args:
-        labeled: Output of ``label_appearances``.
+        labeled: Output of ``label_appearances`` with a ``score`` column.
         horizon_days: Games this many days or fewer before a placement count.
         reps: Bootstrap resamples.
         seed: Random seed.
 
     Returns:
         ``group``, ``phase``, ``placements``, ``auc``, ``lower_95``,
-        ``upper_95``.
+        ``upper_95`` and ``p_value``.
     """
-    values, bins = np.unique(-labeled["alert_z"].to_numpy(), return_inverse=True)
+    values, bins = np.unique(labeled["score"].to_numpy(), return_inverse=True)
     players = labeled["player_id"].rank("dense").cast(pl.Int64).to_numpy() - 1
     player_count = int(players.max()) + 1
     days = labeled["days_to_il"].fill_null(horizon_days + 1).to_numpy()
@@ -195,27 +246,29 @@ def auc_table(
 
     point = aucs(np.ones(labeled.height))
     samples = [aucs(draw[players].astype(float)) for draw in draws]
-    rows = []
+    rows: list[tuple[str, str, int | None, float, float, float, float]] = []
     for name, phase in keys:
         events = labeled.filter(pl.Series(positives[name, phase]))
+        replicates = np.array([sample[name, phase] for sample in samples])
         rows.append(
-            _auc_row(
+            (
                 name,
                 phase,
                 events.select("player_id", "il_start").n_unique(),
                 point[name, phase],
-                np.array([sample[name, phase] for sample in samples]),
+                *bootstrap_summary(replicates, 0.5),
             )
         )
     for phase in PHASES:
         target, placebo = (TARGET_GROUP, phase), (PLACEBO_GROUP, phase)
+        replicates = np.array([sample[target] - sample[placebo] for sample in samples])
         rows.append(
-            _auc_row(
+            (
                 f"{TARGET_GROUP} - {PLACEBO_GROUP}",
                 phase,
                 None,
                 point[target] - point[placebo],
-                np.array([sample[target] - sample[placebo] for sample in samples]),
+                *bootstrap_summary(replicates, 0.0),
             )
         )
     return pl.DataFrame(rows, orient="row", schema=AUC_TABLE_SCHEMA)
@@ -224,13 +277,13 @@ def auc_table(
 def threshold_table(
     labeled: pl.DataFrame, thresholds: Sequence[float], horizon_days: int
 ) -> pl.DataFrame:
-    """How well ``alert_z <= -threshold`` gives warning of an arm placement.
+    """How well ``score >= threshold`` gives warning of an arm placement.
 
     Only warning games count: the final game before a placement is left out,
     since an alert there comes too late to act on. Negatives are healthy games.
 
     Args:
-        labeled: Output of ``label_appearances``.
+        labeled: Output of ``label_appearances`` with a ``score`` column.
         thresholds: Alert thresholds in standard deviations, such as ``2.0``.
         horizon_days: Games this many days or fewer before a placement count.
 
@@ -246,9 +299,9 @@ def threshold_table(
     events = windows.select("player_id", "il_start").n_unique()
     rows = []
     for threshold in thresholds:
-        alerted = sample.filter(pl.col("alert_z") <= -threshold)
+        alerted = sample.filter(pl.col("score") >= threshold)
         caught = (
-            windows.filter(pl.col("alert_z") <= -threshold)
+            windows.filter(pl.col("score") >= threshold)
             .group_by("player_id", "il_start")
             .agg(lead_days=pl.col("days_to_il").max())
         )
@@ -285,11 +338,11 @@ def event_study(labeled: pl.DataFrame, max_starts: int = 8) -> pl.DataFrame:
     ``LOOKBACK_DAYS`` form the ``healthy`` row, with ``starts_before`` null.
 
     Args:
-        labeled: Output of ``label_appearances``.
+        labeled: Output of ``label_appearances`` with a ``score`` column.
         max_starts: Appearances to keep before each placement.
 
     Returns:
-        ``group``, ``starts_before``, ``mean_z``, ``standard_error`` and
+        ``group``, ``starts_before``, ``mean_score``, ``standard_error`` and
         ``appearances``.
     """
     before = (
@@ -307,8 +360,8 @@ def event_study(labeled: pl.DataFrame, max_starts: int = 8) -> pl.DataFrame:
         pl.col("days_to_il").is_null() | (pl.col("days_to_il") > LOOKBACK_DAYS)
     ).with_columns(group=pl.lit("healthy"), starts_before=pl.lit(None, pl.Int32))
     summary = {
-        "mean_z": pl.col("alert_z").mean(),
-        "standard_error": pl.col("alert_z").std() / pl.len().sqrt(),
+        "mean_score": pl.col("score").mean(),
+        "standard_error": pl.col("score").std() / pl.len().sqrt(),
         "appearances": pl.len(),
     }
     keys = ["group", "starts_before"]
@@ -337,7 +390,7 @@ def relative_to_healthy(study: pl.DataFrame) -> pl.DataFrame:
     standard_error = (
         pl.col("standard_error").pow(2) + baseline["standard_error"] ** 2
     ).sqrt()
-    shift = pl.col("mean_z") - baseline["mean_z"]
+    shift = pl.col("mean_score") - baseline["mean_score"]
     return study.filter(pl.col("group") != "healthy").select(
         "group",
         "starts_before",
@@ -362,11 +415,11 @@ def group_contrast(study: pl.DataFrame, group: str, placebo: str) -> pl.DataFram
         ``starts_before``, ``difference`` (group minus placebo), ``lower_95``
         and ``upper_95``.
     """
-    columns = ["starts_before", "mean_z", "standard_error"]
+    columns = ["starts_before", "mean_score", "standard_error"]
     target = study.filter(pl.col("group") == group).select(columns)
     control = study.filter(pl.col("group") == placebo).select(columns)
     joined = target.join(control, on="starts_before", suffix="_placebo")
-    difference = pl.col("mean_z") - pl.col("mean_z_placebo")
+    difference = pl.col("mean_score") - pl.col("mean_score_placebo")
     standard_error = (
         pl.col("standard_error").pow(2) + pl.col("standard_error_placebo").pow(2)
     ).sqrt()
@@ -384,29 +437,29 @@ def current_alerts(
     """Pitchers on alert after their latest game, and what happened next.
 
     Args:
-        states: Output of ``load_alert_states``.
+        states: Output of ``load_alert_states`` with a ``score`` column.
         placements: Output of ``il_placements``.
-        threshold: Alert when ``alert_z <= -threshold``.
+        threshold: Alert when ``score >= threshold``.
         top: Most severe alerts to return.
 
     Returns:
         ``full_name``, ``last_game``, ``talent``, ``gap`` (talent minus own
-        level, in the metric's units), ``alert_z``, and the next IL placement
-        after the last game (``next_il``, ``injury``; null if none), most
-        severe first.
+        level, in the metric's units), the signed ``alert_z``, and the next IL
+        placement after the last game (``next_il``, ``injury``; null if none),
+        most severe first.
     """
     latest_season = states["game_date"].dt.year().max()
     latest = (
         states.filter(pl.col("game_date").dt.year() == latest_season)
         .group_by("player_id")
         .agg(pl.all().sort_by("game_date").last())
-        .filter(pl.col("alert_z") <= -threshold)
-        .sort("alert_z")
+        .filter(pl.col("score") >= threshold)
+        .sort("score", descending=True)
         .head(top)
     )
     return (
         label_appearances(latest, placements)
-        .sort("alert_z")
+        .sort("score", descending=True)
         .select(
             "full_name",
             last_game=pl.col("game_date"),
