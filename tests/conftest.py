@@ -44,6 +44,7 @@ def settings(output_dir: Path, ingest_settings: IngestSettings) -> Settings:
         paths=PathSettings(
             raw_dir=output_dir / "raw",
             warehouse_path=output_dir / "warehouse" / "statecast.duckdb",
+            figures_dir=output_dir / "figures",
         ),
         ingest=ingest_settings,
     )

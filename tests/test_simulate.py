@@ -2,8 +2,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from statecast.evaluation.simulate import simulate_population
+from statecast.evaluation.simulate import Schedule, simulate_population
 from statecast.models.kalman import PopulationParams
+from statecast.models.seasonal import seasonal_effect
 
 PARAMS = PopulationParams(
     mean_reversion=jnp.asarray(0.02),
@@ -12,26 +13,28 @@ PARAMS = PopulationParams(
     population_mean=jnp.asarray(94.0),
     population_sd=jnp.asarray(1.5),
     day_effect_sd=jnp.asarray(0.5),
+    seasonal_knots=jnp.array([-0.3, -0.2, -0.1, 0.1, 0.05, 0.0]),
 )
 
 
 def test_simulate_population_shapes_and_sufficient_statistics() -> None:
-    gaps = jnp.array([0.0, 5.0, 5.0])
+    schedule = Schedule(jnp.array([0.0, 5.0, 5.0]), jnp.array([40.0, 45.0, 50.0]))
 
-    batch, talent = simulate_population(jax.random.key(1), PARAMS, 4, gaps, 12)
+    batch, talent = simulate_population(jax.random.key(1), PARAMS, 4, schedule, 12)
 
     assert talent.shape == batch.mean.shape == (4, 3)
     assert bool(jnp.all(batch.mask))
     assert bool(jnp.all(batch.sample_size == 12.0))
     assert bool(jnp.all(batch.within_ss > 0.0))
-    np.testing.assert_allclose(batch.gap_days[2], gaps)
+    np.testing.assert_allclose(batch.gap_days[2], schedule.gap_days)
+    np.testing.assert_allclose(batch.season_day[2], schedule.season_days)
 
 
 def test_simulated_talent_has_stationary_spread() -> None:
-    gaps = jnp.array([0.0, 400.0])
+    schedule = Schedule(jnp.array([0.0, 400.0]), jnp.array([122.0, 122.0]))
     stationary_var = 0.06**2 / (2.0 * 0.02)
 
-    _, talent = simulate_population(jax.random.key(2), PARAMS, 20_000, gaps, 2)
+    _, talent = simulate_population(jax.random.key(2), PARAMS, 20_000, schedule, 2)
 
     expected_sd = np.sqrt(1.5**2 + stationary_var)
     np.testing.assert_allclose(talent.mean(axis=0), [94.0, 94.0], atol=0.05)
@@ -39,13 +42,23 @@ def test_simulated_talent_has_stationary_spread() -> None:
 
 
 def test_day_effect_adds_independent_game_to_game_variance() -> None:
-    gaps = jnp.array([0.0, 0.0])
+    schedule = Schedule(jnp.array([0.0, 0.0]), jnp.array([122.0, 122.0]))
     pitches = 4
 
     batch, talent = simulate_population(
-        jax.random.key(4), PARAMS, 20_000, gaps, pitches
+        jax.random.key(4), PARAMS, 20_000, schedule, pitches
     )
 
     game_noise = (batch.mean - talent)[:, 1] - (batch.mean - talent)[:, 0]
     expected_var = 2.0 * (0.5**2 + 1.0**2 / pitches)
     np.testing.assert_allclose(game_noise.var(), expected_var, rtol=0.04)
+
+
+def test_seasonal_shift_moves_every_player_the_same_way() -> None:
+    schedule = Schedule(jnp.array([0.0, 0.0]), jnp.array([31.0, 122.0]))
+
+    batch, talent = simulate_population(jax.random.key(5), PARAMS, 20_000, schedule, 25)
+
+    gap = (batch.mean - talent).mean(axis=0)
+    expected = seasonal_effect(PARAMS.seasonal_knots, schedule.season_days)
+    np.testing.assert_allclose(gap, expected, atol=0.02)

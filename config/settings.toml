@@ -3,6 +3,7 @@
 [paths]
 raw_dir = "data/raw"
 warehouse_path = "data/warehouse/statecast.duckdb"
+figures_dir = "outputs/figures"
 
 [ingest]
 # R = regular season, F = wild card, D = division series,

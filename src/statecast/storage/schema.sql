@@ -116,3 +116,44 @@ CREATE TABLE IF NOT EXISTS player_transaction (
     type_desc VARCHAR,
     description VARCHAR
 );
+
+CREATE TABLE IF NOT EXISTS model_run (
+    run_id UUID PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL,
+    model_name VARCHAR NOT NULL,
+    role VARCHAR NOT NULL CHECK (role IN ('pitcher', 'hitter')),
+    metric VARCHAR NOT NULL,
+    pitch_type VARCHAR,
+    seasons SMALLINT[] NOT NULL,
+    player_count INTEGER NOT NULL,
+    appearance_count INTEGER NOT NULL,
+    log_likelihood DOUBLE NOT NULL,
+    iterations INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_parameter (
+    run_id UUID,
+    parameter VARCHAR,
+    estimate DOUBLE NOT NULL,
+    lower_95 DOUBLE NOT NULL,
+    upper_95 DOUBLE NOT NULL,
+    PRIMARY KEY (run_id, parameter)
+);
+
+CREATE TABLE IF NOT EXISTS latent_state (
+    run_id UUID,
+    player_id INTEGER,
+    game_date DATE,
+    sample_size INTEGER NOT NULL,
+    appearance_mean DOUBLE NOT NULL,
+    seasonal_effect DOUBLE NOT NULL DEFAULT 0.0,
+    filtered_mean DOUBLE NOT NULL,
+    filtered_sd DOUBLE NOT NULL,
+    smoothed_mean DOUBLE NOT NULL,
+    smoothed_sd DOUBLE NOT NULL,
+    PRIMARY KEY (run_id, player_id, game_date)
+);
+
+-- Migration for warehouses created before the seasonal curve: older runs had
+-- no seasonal shift, so zero is their correct value.
+ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS seasonal_effect DOUBLE DEFAULT 0.0;

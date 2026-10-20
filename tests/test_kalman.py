@@ -12,6 +12,7 @@ from statecast.models.kalman import (
     FilterResult,
     ObservationBatch,
     PopulationParams,
+    adjusted_means,
     batch_from_frame,
     constrain,
     initial_state,
@@ -20,6 +21,7 @@ from statecast.models.kalman import (
     rts_smoother,
     unconstrain,
 )
+from statecast.models.seasonal import seasonal_effect
 
 PARAMS = PopulationParams(
     mean_reversion=jnp.asarray(0.05),
@@ -28,8 +30,10 @@ PARAMS = PopulationParams(
     population_mean=jnp.asarray(94.0),
     population_sd=jnp.asarray(1.5),
     day_effect_sd=jnp.asarray(0.6),
+    seasonal_knots=jnp.array([-0.4, -0.2, -0.1, 0.15, 0.1, 0.05]),
 )
 GAP_DAYS = jnp.array([0.0, 4.0, 1.0, 120.0])
+SEASON_DAYS = jnp.array([40.0, 44.0, 45.0, 165.0])
 PITCHES = (
     jnp.array([95.1, 94.2, 96.0]),
     jnp.array([93.8, 94.9]),
@@ -53,6 +57,12 @@ def talent_covariance(params: PopulationParams, gap_days: Array) -> Array:
     return params.population_sd**2 + stationary * jnp.exp(-params.mean_reversion * lags)
 
 
+def pitch_mean(params: PopulationParams, owner: Array) -> Array:
+    """Each raw pitch's expected value: population mean plus seasonal shift."""
+    shift = seasonal_effect(params.seasonal_knots, SEASON_DAYS)
+    return params.population_mean + shift[owner]
+
+
 def pitch_covariance(params: PopulationParams) -> tuple[Array, Array]:
     """Joint covariance of every raw pitch, and each pitch's appearance index.
 
@@ -72,11 +82,26 @@ def pitch_covariance(params: PopulationParams) -> tuple[Array, Array]:
     return cov, owner
 
 
-def run_filter() -> tuple[ObservationBatch, FilterResult]:
+def player_batch() -> ObservationBatch:
     means, sizes, within = summaries(PITCHES)
     mask = jnp.ones(len(PITCHES), dtype=bool)
-    batch = ObservationBatch(GAP_DAYS, means, sizes, within, mask)
-    return batch, kalman_filter(PARAMS, *batch)
+    return ObservationBatch(GAP_DAYS, means, sizes, within, mask, SEASON_DAYS)
+
+
+def filter_batch(params: PopulationParams, batch: ObservationBatch) -> FilterResult:
+    return kalman_filter(
+        params,
+        batch.gap_days,
+        adjusted_means(params, batch),
+        batch.sample_size,
+        batch.within_ss,
+        batch.mask,
+    )
+
+
+def run_filter() -> tuple[ObservationBatch, FilterResult]:
+    batch = player_batch()
+    return batch, filter_batch(PARAMS, batch)
 
 
 def test_constrain_round_trips() -> None:
@@ -94,16 +119,15 @@ def test_initial_state_covariance_adds_level_and_stationary_spread() -> None:
     np.testing.assert_allclose(cov, [[level + stationary, level], [level, level]])
 
 
-def test_filter_likelihood_equals_brute_force_over_every_pitch() -> None:
-    _, result = run_filter()
-    cov, _ = pitch_covariance(PARAMS)
+def test_likelihood_equals_brute_force_over_every_pitch() -> None:
+    batch = jax.tree.map(lambda leaf: leaf[None], player_batch())
+    cov, owner = pitch_covariance(PARAMS)
     all_pitches = jnp.concatenate(PITCHES)
 
-    expected = multivariate_normal.logpdf(
-        all_pitches, jnp.full(all_pitches.size, 94.0), cov
-    )
+    total = population_log_likelihood(PARAMS, batch)
 
-    np.testing.assert_allclose(result.log_likelihood, expected, rtol=1e-10)
+    expected = multivariate_normal.logpdf(all_pitches, pitch_mean(PARAMS, owner), cov)
+    np.testing.assert_allclose(total, expected, rtol=1e-10)
 
 
 def test_smoother_matches_exact_gaussian_conditioning() -> None:
@@ -113,7 +137,8 @@ def test_smoother_matches_exact_gaussian_conditioning() -> None:
     all_pitches = jnp.concatenate(PITCHES)
     cross = talent[:, owner]
 
-    exact_mean = 94.0 + cross @ jnp.linalg.solve(cov, all_pitches - 94.0)
+    residual = all_pitches - pitch_mean(PARAMS, owner)
+    exact_mean = 94.0 + cross @ jnp.linalg.solve(cov, residual)
     exact_var = jnp.diag(talent - cross @ jnp.linalg.solve(cov, cross.T))
     smoothed = rts_smoother(result)
 
@@ -129,9 +154,10 @@ def test_padding_changes_nothing() -> None:
         sample_size=jnp.concatenate([batch.sample_size, jnp.ones(3)]),
         within_ss=jnp.concatenate([batch.within_ss, jnp.zeros(3)]),
         mask=jnp.concatenate([batch.mask, jnp.zeros(3, dtype=bool)]),
+        season_day=jnp.concatenate([batch.season_day, jnp.zeros(3)]),
     )
 
-    padded_result = kalman_filter(PARAMS, *padded)
+    padded_result = filter_batch(PARAMS, padded)
     smoothed = rts_smoother(result)
     padded_smoothed = rts_smoother(padded_result)
 
@@ -142,6 +168,7 @@ def test_padding_changes_nothing() -> None:
 def test_population_log_likelihood_sums_players() -> None:
     batch, result = run_filter()
     stacked = jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]), batch)
+    result = filter_batch(PARAMS, batch)
 
     total = population_log_likelihood(PARAMS, stacked)
 
@@ -170,13 +197,14 @@ def test_batch_from_frame_pads_and_measures_gaps_across_seasons() -> None:
     assert batch.gap_days.tolist() == [[0.0, 180.0, 5.0], [0.0, 0.0, 0.0]]
     assert batch.mask.tolist() == [[True, True, True], [True, False, False]]
     assert batch.sample_size[1].tolist() == [15.0, 1.0, 1.0]
+    assert batch.season_day[0].tolist() == [211.0, 26.0, 31.0]
 
 
 def test_day_effect_inflates_measurement_variance() -> None:
     batch, result = run_filter()
     no_day_effect = PARAMS._replace(day_effect_sd=jnp.asarray(1e-9))
 
-    quiet = kalman_filter(no_day_effect, *batch)
+    quiet = filter_batch(no_day_effect, batch)
 
     first_prior_var = initial_state(PARAMS)[1][0, 0]
     first_measurement_var = 0.6**2 + 1.1**2 / 3.0
@@ -187,3 +215,17 @@ def test_day_effect_inflates_measurement_variance() -> None:
     )
     np.testing.assert_allclose(result.filtered_covs[0, 0, 0], expected_var)
     assert float(quiet.filtered_covs[0, 0, 0]) < float(result.filtered_covs[0, 0, 0])
+
+
+def test_seasonal_shift_is_removed_before_filtering() -> None:
+    batch = player_batch()
+    flat = PARAMS._replace(seasonal_knots=jnp.zeros(6))
+    shifted = batch._replace(
+        mean=batch.mean + seasonal_effect(PARAMS.seasonal_knots, SEASON_DAYS)
+    )
+
+    with_curve = filter_batch(PARAMS, shifted)
+    without_curve = filter_batch(flat, batch)
+
+    np.testing.assert_allclose(with_curve.filtered_means, without_curve.filtered_means)
+    np.testing.assert_allclose(with_curve.log_likelihood, without_curve.log_likelihood)

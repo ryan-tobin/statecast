@@ -14,10 +14,12 @@ class PathSettings:
     Attributes:
         raw_dir: Root of the immutable raw Parquet cache.
         warehouse_path: DuckDB database file.
+        figures_dir: Folder for rendered charts.
     """
 
     raw_dir: Path
     warehouse_path: Path
+    figures_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +83,7 @@ def load_settings(settings_path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
         paths = PathSettings(
             raw_dir=project_root / raw_settings["paths"]["raw_dir"],
             warehouse_path=project_root / raw_settings["paths"]["warehouse_path"],
+            figures_dir=project_root / raw_settings["paths"]["figures_dir"],
         )
         ingest_table = raw_settings["ingest"]
         ingest = IngestSettings(

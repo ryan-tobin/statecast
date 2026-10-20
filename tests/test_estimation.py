@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from statecast.evaluation.simulate import simulate_population
+from statecast.evaluation.simulate import Schedule, simulate_population
 from statecast.models.estimation import (
     FitResult,
     fit_population,
@@ -19,9 +19,14 @@ TRUE_PARAMS = PopulationParams(
     population_mean=jnp.asarray(94.0),
     population_sd=jnp.asarray(1.5),
     day_effect_sd=jnp.asarray(0.5),
+    seasonal_knots=jnp.array([-0.25, -0.15, -0.05, 0.05, 0.05, 0.0]),
 )
-SCHEDULE = jnp.concatenate(
-    [jnp.zeros(1), jnp.full(29, 5.0), jnp.full(1, 150.0), jnp.full(29, 5.0)]
+STARTS_PER_SEASON = 36
+ONE_SEASON = 28.0 + 5.0 * jnp.arange(STARTS_PER_SEASON)
+CALENDAR_DAYS = jnp.concatenate([ONE_SEASON, ONE_SEASON + 365.0])
+SCHEDULE = Schedule(
+    gap_days=jnp.concatenate([jnp.zeros(1), jnp.diff(CALENDAR_DAYS)]),
+    season_days=jnp.concatenate([ONE_SEASON, ONE_SEASON]),
 )
 
 
@@ -50,6 +55,7 @@ def test_initial_guess_starts_near_pooled_moments() -> None:
     np.testing.assert_allclose(guess.population_mean, 94.0, atol=0.3)
     np.testing.assert_allclose(guess.observation_sd, 1.0, rtol=0.02)
     assert 0.0 < float(guess.day_effect_sd) < 1.0
+    np.testing.assert_allclose(guess.seasonal_knots, np.zeros(6))
 
 
 def test_summarize_fit_reports_derived_quantities(recovered: FitResult) -> None:
@@ -64,3 +70,16 @@ def test_summarize_fit_reports_derived_quantities(recovered: FitResult) -> None:
     )
     for row in rows.values():
         assert row["lower_95"] < row["estimate"] < row["upper_95"]
+
+
+def test_summarize_fit_lists_seasonal_knots(recovered: FitResult) -> None:
+    names = summarize_fit(recovered)["parameter"].to_list()
+
+    assert names[6:12] == [
+        "season_apr",
+        "season_may",
+        "season_jun",
+        "season_aug",
+        "season_sep",
+        "season_oct",
+    ]

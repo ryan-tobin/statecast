@@ -6,9 +6,12 @@ effect drawn from the population, so the filter integrates it out exactly.
 
 Each appearance adds a one-day shock ``delta ~ N(0, tau^2)`` shared by every
 pitch in it (rest, weather, adrenaline) that does not persist to the next
-appearance. Each appearance is summarized by sufficient statistics of its
-``n`` pitches (or swings): the mean ``ybar`` and the within-appearance sum of
-squares ``S``, so ``ybar ~ N(talent, tau^2 + r^2 / n)``.
+appearance, plus a league-wide seasonal shift ``g(day)`` shared by every
+player. Each appearance is summarized by sufficient statistics of its ``n``
+pitches (or swings): the mean ``ybar`` and the within-appearance sum of
+squares ``S``, so ``ybar ~ N(talent + g(day), tau^2 + r^2 / n)``. The filter
+works on season-adjusted means ``ybar - g(day)``, so talent is the July 1
+equivalent.
 """
 
 from typing import NamedTuple
@@ -20,6 +23,7 @@ import polars as pl
 from jax import Array
 
 from statecast.models.dynamics import STATE_DIM, talent_transition
+from statecast.models.seasonal import FREE_KNOT_COUNT, season_day, seasonal_effect
 
 LOG_TWO_PI = float(np.log(2.0 * np.pi))
 OBSERVATION_ROW = jnp.array([1.0, 0.0])
@@ -35,6 +39,8 @@ class PopulationParams(NamedTuple):
         population_mean: ``m``, mean long-run level across players (units).
         population_sd: ``s``, spread of long-run levels across players (units).
         day_effect_sd: ``tau``, one-game shock shared by its pitches (units).
+        seasonal_knots: League seasonal shift at each monthly knot except
+            July 1 (anchored at zero), shape ``(6,)`` (units).
     """
 
     mean_reversion: Array
@@ -43,6 +49,7 @@ class PopulationParams(NamedTuple):
     population_mean: Array
     population_sd: Array
     day_effect_sd: Array
+    seasonal_knots: Array
 
 
 class ObservationBatch(NamedTuple):
@@ -57,6 +64,7 @@ class ObservationBatch(NamedTuple):
         sample_size: Pitches or swings in the appearance.
         within_ss: Sum of squared deviations from the appearance mean.
         mask: True for real appearances.
+        season_day: Days since March 1 of the appearance's year.
     """
 
     gap_days: Array
@@ -64,6 +72,7 @@ class ObservationBatch(NamedTuple):
     sample_size: Array
     within_ss: Array
     mask: Array
+    season_day: Array
 
 
 class FilterResult(NamedTuple):
@@ -99,12 +108,13 @@ class SmoothedResult(NamedTuple):
 
 
 def constrain(raw: Array) -> PopulationParams:
-    """Map an unconstrained vector of length 6 to population parameters.
+    """Map an unconstrained vector of length 12 to population parameters.
 
-    Positive parameters are stored as logs; the population mean is unbounded.
+    Positive parameters are stored as logs; the population mean and the
+    seasonal knots are unbounded.
 
     Args:
-        raw: ``[log kappa, log sigma, log r, m, log s, log tau]``.
+        raw: ``[log kappa, log sigma, log r, m, log s, log tau, knots...]``.
 
     Returns:
         The natural-scale parameters.
@@ -116,6 +126,7 @@ def constrain(raw: Array) -> PopulationParams:
         population_mean=raw[3],
         population_sd=jnp.exp(raw[4]),
         day_effect_sd=jnp.exp(raw[5]),
+        seasonal_knots=raw[6 : 6 + FREE_KNOT_COUNT],
     )
 
 
@@ -126,9 +137,9 @@ def unconstrain(params: PopulationParams) -> Array:
         params: Natural-scale parameters.
 
     Returns:
-        ``[log kappa, log sigma, log r, m, log s, log tau]``.
+        ``[log kappa, log sigma, log r, m, log s, log tau, knots...]``.
     """
-    return jnp.array(
+    scalars = jnp.array(
         [
             jnp.log(params.mean_reversion),
             jnp.log(params.diffusion),
@@ -138,6 +149,20 @@ def unconstrain(params: PopulationParams) -> Array:
             jnp.log(params.day_effect_sd),
         ]
     )
+    return jnp.concatenate([scalars, params.seasonal_knots])
+
+
+def adjusted_means(params: PopulationParams, batch: ObservationBatch) -> Array:
+    """Appearance means with the league seasonal shift removed.
+
+    Args:
+        params: Population parameters.
+        batch: Appearances, any leading shape.
+
+    Returns:
+        ``mean - g(season_day)``, same shape as ``batch.mean``.
+    """
+    return batch.mean - seasonal_effect(params.seasonal_knots, batch.season_day)
 
 
 def initial_state(params: PopulationParams) -> tuple[Array, Array]:
@@ -326,7 +351,13 @@ def population_log_likelihood(
         lambda gap, mean, size, ss, mask: (
             kalman_filter(params, gap, mean, size, ss, mask).log_likelihood
         )
-    )(batch.gap_days, batch.mean, batch.sample_size, batch.within_ss, batch.mask)
+    )(
+        batch.gap_days,
+        adjusted_means(params, batch),
+        batch.sample_size,
+        batch.within_ss,
+        batch.mask,
+    )
     return jnp.sum(per_player)
 
 
@@ -349,6 +380,8 @@ def batch_from_frame(appearances: pl.DataFrame) -> tuple[ObservationBatch, Array
         >>> batch, player_ids = batch_from_frame(frame)
         >>> batch.gap_days.tolist(), player_ids.tolist()
         ([[0.0, 5.0], [0.0, 0.0]], [7, 9])
+        >>> batch.season_day.tolist()
+        [[31.0, 36.0], [32.0, 0.0]]
     """
     ordered = appearances.sort("player_id", "game_date").with_columns(
         player_index=pl.col("player_id").rank("dense") - 1,
@@ -359,6 +392,7 @@ def batch_from_frame(appearances: pl.DataFrame) -> tuple[ObservationBatch, Array
         .dt.total_days()
         .fill_null(0)
         .cast(pl.Float64),
+        season_day=season_day(pl.col("game_date")).cast(pl.Float64),
     )
     rows = ordered["player_index"].to_numpy()
     columns = ordered["position"].to_numpy()
@@ -377,6 +411,7 @@ def batch_from_frame(appearances: pl.DataFrame) -> tuple[ObservationBatch, Array
         sample_size=scatter("sample_size", 1.0),
         within_ss=scatter("within_ss", 0.0),
         mask=jnp.asarray(mask),
+        season_day=scatter("season_day", 0.0),
     )
     player_ids = ordered.unique("player_id", maintain_order=True)["player_id"]
     return batch, jnp.asarray(player_ids.to_numpy())

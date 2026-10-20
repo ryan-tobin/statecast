@@ -8,6 +8,7 @@ VALID_SETTINGS = """
 [paths]
 raw_dir = "data/raw"
 warehouse_path = "data/warehouse/statecast.duckdb"
+figures_dir = "outputs/figures"
 
 [ingest]
 game_types = ["R", "W"]

@@ -17,6 +17,7 @@ from statecast.models.kalman import (
     population_log_likelihood,
     unconstrain,
 )
+from statecast.models.seasonal import FREE_KNOT_COUNT, FREE_KNOT_NAMES
 
 PRIOR_HALF_LIFE_DAYS = 60.0
 MIN_EXCESS_FRACTION = 0.01
@@ -28,8 +29,9 @@ PARAMETER_NAMES = (
     "population_mean",
     "population_sd",
     "day_effect_sd",
+    *(f"season_{name}" for name in FREE_KNOT_NAMES),
 )
-LOG_SCALE = (True, True, True, False, True, True)
+LOG_SCALE = (True, True, True, False, True, True, *([False] * FREE_KNOT_COUNT))
 
 
 class FitResult(NamedTuple):
@@ -38,7 +40,7 @@ class FitResult(NamedTuple):
     Attributes:
         params: Estimated natural-scale parameters.
         unconstrained: Estimate as ``[log kappa, log sigma, log r, m, log s,
-            log tau]``.
+            log tau, seasonal knots...]``.
         unconstrained_cov: Inverse observed information on that scale.
         log_likelihood: Maximized total log-likelihood.
         iterations: L-BFGS iterations used.
@@ -64,7 +66,7 @@ def initial_guess(batch: ObservationBatch) -> PopulationParams:
         the spread of player means, and a 60-day half-life. The excess
         appearance-to-appearance variance within players (beyond the
         ``r^2 / n`` sampling noise) is split evenly between the day effect and
-        stationary talent wander.
+        stationary talent wander. The seasonal curve starts flat.
     """
     weights = jnp.where(batch.mask, batch.sample_size, 0.0)
     appearances = jnp.sum(batch.mask)
@@ -88,6 +90,7 @@ def initial_guess(batch: ObservationBatch) -> PopulationParams:
         population_mean=population_mean,
         population_sd=population_sd,
         day_effect_sd=jnp.sqrt(0.5 * excess_var),
+        seasonal_knots=jnp.zeros(FREE_KNOT_COUNT),
     )
 
 
@@ -151,6 +154,9 @@ def fit_population(
 
 def summarize_fit(fit: FitResult) -> pl.DataFrame:
     """Tabulate estimates with 95% intervals, plus two derived quantities.
+
+    Seasonal knots (``season_apr`` and so on) are shifts from the July 1
+    level, in the metric's units.
 
     Intervals are Wald intervals on the unconstrained scale, mapped back, so
     positive parameters get asymmetric intervals that stay positive. The talent

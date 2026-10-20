@@ -30,6 +30,9 @@ WAREHOUSE_TABLES = frozenset(
         "pitch",
         "swing",
         "player_transaction",
+        "model_run",
+        "model_parameter",
+        "latent_state",
     }
 )
 SEASON_DIR_PATTERN = re.compile(r"season=(\d{4})")
