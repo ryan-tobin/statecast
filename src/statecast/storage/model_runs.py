@@ -37,6 +37,27 @@ ORDER BY player_id
 
 PITCH_NAME_SQL = "SELECT name FROM pitch_type WHERE code = $code"
 
+LATEST_POPULATION_RUN_SQL = """
+SELECT r.run_id, r.role, r.metric, r.pitch_type, pt.name
+FROM model_run AS r
+LEFT JOIN pitch_type AS pt ON pt.code = r.pitch_type
+WHERE r.role = $role
+  AND r.metric = $metric
+  AND r.pitch_type IS NOT DISTINCT FROM $pitch_type
+ORDER BY r.created_at DESC
+LIMIT 1
+"""
+
+ALERT_STATES_SQL = """
+SELECT s.player_id, p.full_name, s.game_date, s.filtered_mean,
+       s.filtered_gap_mean, s.alert_z
+FROM latent_state AS s
+JOIN player AS p USING (player_id)
+WHERE s.run_id = $run_id
+  AND s.alert_z IS NOT NULL
+ORDER BY s.player_id, s.game_date
+"""
+
 TRAJECTORY_SQL = """
 SELECT game_date, sample_size, appearance_mean, seasonal_effect,
        filtered_mean, filtered_sd, smoothed_mean, smoothed_sd
@@ -234,3 +255,51 @@ def pitch_type_name(
         return None
     row = connection.execute(PITCH_NAME_SQL, {"code": code}).fetchone()
     return None if row is None else str(row[0])
+
+
+def latest_run(connection: duckdb.DuckDBPyConnection, spec: RunSpec) -> RunInfo:
+    """Find the most recent run fitted to one population, whoever is in it.
+
+    ``spec.seasons`` is ignored; the newest run of the role, metric and pitch
+    type wins.
+
+    Args:
+        connection: Warehouse connection.
+        spec: Role, metric and pitch type to match.
+
+    Returns:
+        The run's identifier and what it was fitted to.
+
+    Raises:
+        LookupError: If no stored run matches.
+    """
+    parameters = {
+        "role": spec.role,
+        "metric": spec.metric,
+        "pitch_type": spec.pitch_type,
+    }
+    row = connection.execute(LATEST_POPULATION_RUN_SQL, parameters).fetchone()
+    if row is None:
+        raise LookupError(
+            f"No {spec.role} run of {spec.metric} for pitch type {spec.pitch_type}"
+        )
+    run_id, run_role, run_metric, pitch_type, pitch_name = row
+    return RunInfo(run_id, run_role, run_metric, pitch_type, pitch_name)
+
+
+def load_alert_states(
+    connection: duckdb.DuckDBPyConnection, run_id: uuid.UUID
+) -> pl.DataFrame:
+    """Read every player's real-time talent, gap to own level and alert score.
+
+    Runs stored before alert scores were recorded return no rows.
+
+    Args:
+        connection: Warehouse connection.
+        run_id: Run identifier.
+
+    Returns:
+        ``player_id``, ``full_name``, ``game_date``, ``filtered_mean``,
+        ``filtered_gap_mean`` and ``alert_z``, by player and date.
+    """
+    return connection.execute(ALERT_STATES_SQL, {"run_id": str(run_id)}).pl()

@@ -286,3 +286,39 @@ def test_trajectory_then_chart_end_to_end(
     figures = output_dir / "outputs" / "figures"
     assert (figures / "zack_wheeler_ff_release_speed.png").exists()
     assert (figures / "league_seasonal_ff_release_speed.png").exists()
+
+    with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
+        upsert_table(
+            connection,
+            "player_transaction",
+            pl.DataFrame(
+                {
+                    "transaction_id": [1],
+                    "player_id": [554430],
+                    "transaction_date": [date(2026, 4, 15)],
+                    "effective_date": [date(2026, 4, 15)],
+                    "type_code": ["SC"],
+                    "type_desc": ["Status Change"],
+                    "description": [
+                        "Philadelphia Phillies placed RHP Zack Wheeler on the "
+                        "15-day injured list retroactive to April 13, 2026. "
+                        "Right shoulder fatigue."
+                    ],
+                }
+            ),
+        )
+    alerted = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
+
+    assert alerted.exit_code == 0, alerted.output
+    assert "AUC, arm IL within 30 days" in alerted.output
+    assert (figures / "il_event_study_ff_release_speed.png").exists()
+
+
+def test_alerts_exits_nonzero_without_a_run(output_dir: Path) -> None:
+    settings_path = fit_settings(output_dir)
+    with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
+        initialize_schema(connection)
+
+    result = runner.invoke(cli.app, ["alerts", "--settings", str(settings_path)])
+
+    assert result.exit_code == 1

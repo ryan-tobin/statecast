@@ -1,5 +1,7 @@
 """Per-player talent trajectories from a fitted population model."""
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,6 +18,52 @@ from statecast.models.kalman import (
     rts_smoother,
 )
 from statecast.models.seasonal import seasonal_effect
+
+MIN_NULL_VARIANCE = 1e-12
+
+
+class GapScores(NamedTuple):
+    """Real-time gap between talent and the player's own long-run level.
+
+    Attributes:
+        mean: ``E[talent - level | games so far]`` (units).
+        sd: ``sd[talent - level | games so far]`` (units).
+        alert_z: ``mean`` scaled to be exactly ``N(0, 1)`` when the player's
+            talent follows the model; strongly negative means unusually far
+            below his own level.
+    """
+
+    mean: Array
+    sd: Array
+    alert_z: Array
+
+
+def gap_scores(params: PopulationParams, filtered: FilterResult) -> GapScores:
+    """Score how far each player's real-time talent sits below his own level.
+
+    The gap ``g = talent - level`` is a stationary OU deviation with prior
+    variance ``v = sigma^2 / (2 kappa)``. In a linear Gaussian model the
+    posterior variance ``P = Var(g | y)`` does not depend on the data, so the
+    posterior mean ``E[g | y]`` has marginal variance ``v - P``. Dividing by
+    ``sqrt(v - P)`` makes the score exactly standard normal under the model,
+    so thresholds read as tail probabilities. (Dividing by ``sqrt(P)`` instead
+    would understate surprises: early in a career ``P`` is near ``v`` and the
+    posterior mean barely moves.)
+
+    Args:
+        params: Population parameters.
+        filtered: Filter output, any leading shape.
+
+    Returns:
+        Gap mean, gap sd and the calibrated alert score.
+    """
+    means = filtered.filtered_means
+    covs = filtered.filtered_covs
+    gap_mean = means[..., 0] - means[..., 1]
+    gap_var = jnp.clip(covs[..., 0, 0] + covs[..., 1, 1] - 2.0 * covs[..., 0, 1], 0.0)
+    prior_var = params.diffusion**2 / (2.0 * params.mean_reversion)
+    null_sd = jnp.sqrt(jnp.clip(prior_var - gap_var, MIN_NULL_VARIANCE))
+    return GapScores(mean=gap_mean, sd=jnp.sqrt(gap_var), alert_z=gap_mean / null_sd)
 
 
 def smooth_population(
@@ -52,7 +100,7 @@ def smooth_population(
 def trajectory_frame(
     appearances: pl.DataFrame,
     batch: ObservationBatch,
-    seasonal_knots: Array,
+    params: PopulationParams,
     filtered: FilterResult,
     smoothed: SmoothedResult,
 ) -> pl.DataFrame:
@@ -65,19 +113,23 @@ def trajectory_frame(
     Args:
         appearances: The frame the batch was built from.
         batch: The padded batch.
-        seasonal_knots: Fitted seasonal knots, to record each game's shift.
+        params: Fitted population parameters.
         filtered: Filter output with a leading player axis.
         smoothed: Smoother output with a leading player axis.
 
     Returns:
         One row per appearance: ``player_id``, ``game_date``, ``sample_size``,
-        the raw ``appearance_mean``, its ``seasonal_effect``, and the filtered
+        the raw ``appearance_mean``, its ``seasonal_effect``, the filtered
         (real-time) and smoothed (hindsight) talent mean and standard
-        deviation, all season-adjusted to July 1.
+        deviation, all season-adjusted to July 1, and the real-time gap to
+        the player's own level (``filtered_gap_mean``, ``filtered_gap_sd``)
+        with its calibrated ``alert_z``.
     """
     mask = np.asarray(batch.mask)
+    gaps = gap_scores(params, filtered)
+    shift = seasonal_effect(params.seasonal_knots, batch.season_day)
 
-    def talent(values: Array) -> np.ndarray:
+    def real(values: Array) -> np.ndarray:
         real_cells: np.ndarray = np.asarray(values)[mask]
         return real_cells
 
@@ -90,10 +142,13 @@ def trajectory_frame(
             pl.col("mean").alias("appearance_mean"),
         )
         .with_columns(
-            seasonal_effect=talent(seasonal_effect(seasonal_knots, batch.season_day)),
-            filtered_mean=talent(filtered.filtered_means[..., 0]),
-            filtered_sd=np.sqrt(talent(filtered.filtered_covs[..., 0, 0])),
-            smoothed_mean=talent(smoothed.means[..., 0]),
-            smoothed_sd=np.sqrt(talent(jnp.clip(smoothed.covs[..., 0, 0], 0.0))),
+            seasonal_effect=real(shift),
+            filtered_mean=real(filtered.filtered_means[..., 0]),
+            filtered_sd=np.sqrt(real(filtered.filtered_covs[..., 0, 0])),
+            smoothed_mean=real(smoothed.means[..., 0]),
+            smoothed_sd=np.sqrt(real(jnp.clip(smoothed.covs[..., 0, 0], 0.0))),
+            filtered_gap_mean=real(gaps.mean),
+            filtered_gap_sd=real(gaps.sd),
+            alert_z=real(gaps.alert_z),
         )
     )

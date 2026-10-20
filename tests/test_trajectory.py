@@ -1,9 +1,11 @@
 from datetime import date
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import polars as pl
 
+from statecast.evaluation.simulate import Schedule, simulate_population
 from statecast.models.kalman import (
     PopulationParams,
     adjusted_means,
@@ -12,7 +14,11 @@ from statecast.models.kalman import (
     rts_smoother,
 )
 from statecast.models.seasonal import seasonal_effect
-from statecast.models.trajectory import smooth_population, trajectory_frame
+from statecast.models.trajectory import (
+    gap_scores,
+    smooth_population,
+    trajectory_frame,
+)
 
 PARAMS = PopulationParams(
     mean_reversion=jnp.asarray(0.01),
@@ -61,7 +67,7 @@ def test_trajectory_frame_aligns_rows_with_sorted_appearances() -> None:
     batch, _ = batch_from_frame(FRAME)
     filtered, smoothed = smooth_population(PARAMS, batch)
 
-    paths = trajectory_frame(FRAME, batch, PARAMS.seasonal_knots, filtered, smoothed)
+    paths = trajectory_frame(FRAME, batch, PARAMS, filtered, smoothed)
 
     assert paths.select("player_id", "game_date").rows() == [
         (4, date(2026, 4, 1)),
@@ -79,3 +85,33 @@ def test_trajectory_frame_aligns_rows_with_sorted_appearances() -> None:
         PARAMS.seasonal_knots, jnp.array([31.0, 35.0, 40.0, 33.0, 38.0])
     )
     np.testing.assert_allclose(paths["seasonal_effect"], expected_shift)
+
+
+def test_trajectory_frame_reports_real_time_gap_to_own_level() -> None:
+    batch, _ = batch_from_frame(FRAME)
+    filtered, smoothed = smooth_population(PARAMS, batch)
+
+    paths = trajectory_frame(FRAME, batch, PARAMS, filtered, smoothed)
+
+    means = np.asarray(filtered.filtered_means[0, :3])
+    covs = np.asarray(filtered.filtered_covs[0, :3])
+    gap_var = covs[:, 0, 0] + covs[:, 1, 1] - 2.0 * covs[:, 0, 1]
+    prior_var = 0.1**2 / (2.0 * 0.01)
+    gap_mean = means[:, 0] - means[:, 1]
+    np.testing.assert_allclose(paths["filtered_gap_mean"][:3], gap_mean)
+    np.testing.assert_allclose(paths["filtered_gap_sd"][:3], np.sqrt(gap_var))
+    np.testing.assert_allclose(
+        paths["alert_z"][:3], gap_mean / np.sqrt(prior_var - gap_var)
+    )
+
+
+def test_alert_score_is_standard_normal_when_talent_follows_the_model() -> None:
+    days = 30.0 + 5.0 * jnp.arange(20)
+    schedule = Schedule(jnp.concatenate([jnp.zeros(1), jnp.diff(days)]), days)
+    batch, _ = simulate_population(jax.random.key(7), PARAMS, 20_000, schedule, 20)
+    filtered, _ = smooth_population(PARAMS, batch)
+
+    scores = np.asarray(gap_scores(PARAMS, filtered).alert_z)
+
+    np.testing.assert_allclose(scores[:, [1, 9, 19]].mean(axis=0), 0.0, atol=0.03)
+    np.testing.assert_allclose(scores[:, [1, 9, 19]].std(axis=0), 1.0, rtol=0.03)

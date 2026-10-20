@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 from matplotlib.figure import Figure
 
+from statecast.viz.injury_alerts import plot_event_study, spread_labels
 from statecast.viz.seasonal import plot_seasonal_curve, seasonal_knots
 from statecast.viz.trajectories import (
     chart_labels,
@@ -142,3 +143,52 @@ def test_plot_seasonal_curve_leaves_room_for_the_anchor_label() -> None:
 def test_season_span() -> None:
     assert season_span([2026]) == "2026"
     assert season_span([2026, 2024]) == "2024-2026"
+
+
+def event_study_frame() -> pl.DataFrame:
+    starts = list(range(-8, 0))
+    means = [
+        *(-0.15 * (9 + k) for k in starts),
+        *(-0.01 * (9 + k) for k in starts),
+        0.01,
+    ]
+    return pl.DataFrame(
+        {
+            "group": ["arm"] * 8 + ["other"] * 8 + ["healthy"],
+            "starts_before": [*starts, *starts, None],
+            "mean_z": means,
+            "lower_95": [mean - 0.2 for mean in means],
+            "upper_95": [mean + 0.2 for mean in means],
+            "appearances": [140] * 16 + [50_000],
+        },
+        schema_overrides={"starts_before": pl.Int32, "appearances": pl.UInt32},
+    )
+
+
+def test_plot_event_study_saves_with_labels_inside(output_dir: Path) -> None:
+    path = output_dir / "event_study.png"
+
+    figure = plot_event_study(
+        event_study_frame(), "Velocity before injured-list stints", "Subtitle"
+    )
+    save_figure(figure, path)
+
+    labels = [text.get_text() for text in figure.axes[0].texts]
+    assert "Arm injury (140)" in labels
+    assert path.stat().st_size > 10_000
+    assert_text_inside(figure)
+
+
+def test_plot_event_study_rejects_empty_study() -> None:
+    empty = event_study_frame().filter(pl.col("group") == "healthy")
+
+    with pytest.raises(ValueError, match="no appearances"):
+        plot_event_study(empty, "Title", "Subtitle")
+
+
+def test_spread_labels_separates_close_labels_and_keeps_order() -> None:
+    heights = spread_labels([-0.05, 0.0, -1.3], gap=0.1)
+
+    assert heights[2] == -1.3
+    assert heights[0] == -0.05
+    assert heights[1] - heights[0] >= 0.1 - 1e-12

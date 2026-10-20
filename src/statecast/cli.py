@@ -1,11 +1,11 @@
-"""Command-line interface: ingest, load, fit, trajectory and chart."""
+"""Command-line interface: ingest, load, fit, trajectory, chart and alerts."""
 
 import asyncio
 import logging
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Final
 
 import duckdb
 import jax
@@ -13,7 +13,16 @@ import polars as pl
 import typer
 
 from statecast.config import DEFAULT_SETTINGS_PATH, Settings, load_settings
+from statecast.evaluation.injury_alerts import (
+    INJURY_GROUPS,
+    current_alerts,
+    event_study,
+    label_appearances,
+    roc_auc,
+    threshold_table,
+)
 from statecast.features.appearance import hitter_appearances, pitcher_appearances
+from statecast.features.injuries import il_placements
 from statecast.ingest.pipeline import run_ingest
 from statecast.logging_setup import configure_logging
 from statecast.models.estimation import (
@@ -27,12 +36,15 @@ from statecast.models.trajectory import smooth_population, trajectory_frame
 from statecast.storage.model_runs import (
     RunSpec,
     find_player,
+    latest_run,
     latest_run_for_player,
+    load_alert_states,
     load_trajectory,
     pitch_type_name,
     save_run,
 )
 from statecast.storage.warehouse import build_warehouse
+from statecast.viz.injury_alerts import plot_event_study
 from statecast.viz.seasonal import plot_seasonal_curve
 from statecast.viz.trajectories import (
     chart_labels,
@@ -43,6 +55,7 @@ from statecast.viz.trajectories import (
 )
 
 logger = logging.getLogger(__name__)
+ALERT_THRESHOLDS: Final = (1.0, 1.5, 2.0, 2.5, 3.0)
 
 app = typer.Typer(help="statecast data pipeline.", no_args_is_help=True)
 
@@ -55,6 +68,12 @@ SeasonsOption = Annotated[
 ]
 MetricOption = Annotated[str | None, typer.Option(help="Metric column.")]
 PitchTypeOption = Annotated[str, typer.Option(help="Pitch type (pitchers).")]
+HorizonOption = Annotated[
+    int, typer.Option(help="Days after a game that count as before an IL stint.")
+]
+ThresholdOption = Annotated[
+    float, typer.Option(help="Alert when talent is this many sd below level.")
+]
 AnyPitchTypeOption = Annotated[
     str | None, typer.Option(help="Pitch type, such as FF; any when omitted.")
 ]
@@ -249,9 +268,7 @@ def trajectory(
     with duckdb.connect(str(settings.paths.warehouse_path)) as con:
         frame, batch, result = _load_and_fit(con, spec)
         filtered, smoothed = smooth_population(result.params, batch)
-        paths = trajectory_frame(
-            frame, batch, result.params.seasonal_knots, filtered, smoothed
-        )
+        paths = trajectory_frame(frame, batch, result.params, filtered, smoothed)
         run_id = save_run(con, spec, result, paths)
         pitch_name = pitch_type_name(con, spec.pitch_type)
     summary = summarize_fit(result)
@@ -308,6 +325,62 @@ def chart(
         full_name, run.metric, run.pitch_type
     )
     save_figure(plot_talent_fan(path_frame, labels), output)
+    typer.echo(output)
+
+
+@app.command()
+def alerts(
+    pitch_type: PitchTypeOption = "FF",
+    horizon_days: HorizonOption = 30,
+    threshold: ThresholdOption = 2.0,
+    settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
+) -> None:
+    """Test whether real-time velocity drops come before IL placements.
+
+    Uses the latest pitcher velocity run for the pitch type. Prints how well
+    each alert threshold warns of arm IL placements, the AUC for arm and
+    other injuries, and pitchers on alert after their latest game, then draws
+    the event-study chart.
+
+    Args:
+        pitch_type: Pitch type of the run to score, such as ``FF``.
+        horizon_days: Days after a game that count as before an IL stint.
+        threshold: Alert threshold for the current-alerts table.
+        settings_path: Path to ``settings.toml``.
+
+    Raises:
+        typer.Exit: With code 1 if no run has alert scores.
+    """
+    settings = _load_or_exit(settings_path)
+    spec = RunSpec(Role.PITCHER, "release_speed", pitch_type, ())
+    with duckdb.connect(str(settings.paths.warehouse_path), read_only=True) as con:
+        try:
+            run = latest_run(con, spec)
+        except LookupError as error:
+            logger.error("%s; run `statecast trajectory pitcher` first", error)
+            raise typer.Exit(code=1) from error
+        states = load_alert_states(con, run.run_id)
+        placements = il_placements(con)
+    if states.is_empty():
+        logger.error("Run %s has no alert scores; rerun trajectory", run.run_id)
+        raise typer.Exit(code=1)
+    labeled = label_appearances(states, placements)
+    _echo_table(threshold_table(labeled, ALERT_THRESHOLDS, horizon_days))
+    for group in INJURY_GROUPS:
+        auc = roc_auc(labeled, horizon_days, group)
+        typer.echo(f"AUC, {group} IL within {horizon_days} days: {auc:.3f}")
+    _echo_table(current_alerts(labeled, threshold))
+    seasons = sorted(set(states["game_date"].dt.year().to_list()))
+    pitch_name = (run.pitch_name or pitch_type).lower()
+    title = f"Velocity before injured-list stints, {pitch_name}"
+    subtitle = (
+        f"Mean real-time alert score by appearance, "
+        f"{season_span(seasons)} regular season"
+    )
+    output = settings.paths.figures_dir / figure_filename(
+        "il event study", spec.metric, pitch_type
+    )
+    save_figure(plot_event_study(event_study(labeled), title, subtitle), output)
     typer.echo(output)
 
 

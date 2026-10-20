@@ -151,9 +151,16 @@ CREATE TABLE IF NOT EXISTS latent_state (
     filtered_sd DOUBLE NOT NULL,
     smoothed_mean DOUBLE NOT NULL,
     smoothed_sd DOUBLE NOT NULL,
+    filtered_gap_mean DOUBLE,
+    filtered_gap_sd DOUBLE,
+    alert_z DOUBLE,
     PRIMARY KEY (run_id, player_id, game_date)
 );
 
 -- Migration for warehouses created before the seasonal curve: older runs had
 -- no seasonal shift, so zero is their correct value.
 ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS seasonal_effect DOUBLE DEFAULT 0.0;
+
+ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS filtered_gap_mean DOUBLE;
+ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS filtered_gap_sd DOUBLE;
+ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS alert_z DOUBLE;

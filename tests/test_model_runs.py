@@ -13,7 +13,9 @@ from statecast.storage.model_runs import (
     PlayerLookupError,
     RunSpec,
     find_player,
+    latest_run,
     latest_run_for_player,
+    load_alert_states,
     load_trajectory,
     pitch_type_name,
     save_run,
@@ -52,6 +54,9 @@ def paths(player_ids: list[int]) -> pl.DataFrame:
             "filtered_sd": [0.4] * len(player_ids),
             "smoothed_mean": [94.8] * len(player_ids),
             "smoothed_sd": [0.3] * len(player_ids),
+            "filtered_gap_mean": [-0.6] * len(player_ids),
+            "filtered_gap_sd": [0.5] * len(player_ids),
+            "alert_z": [-2.4] * len(player_ids),
         },
         schema_overrides={"player_id": pl.Int32, "sample_size": pl.Int32},
     )
@@ -179,3 +184,35 @@ def test_pitch_type_name_looks_up_codes(
     assert pitch_type_name(connection, "FF") == "4-Seam Fastball"
     assert pitch_type_name(connection, "ZZ") is None
     assert pitch_type_name(connection, None) is None
+
+
+def test_latest_run_matches_population_regardless_of_players(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    save_run(connection, PITCHER_SPEC, FIT, paths([554430]))
+    newest = save_run(connection, PITCHER_SPEC, FIT, paths([650911]))
+    hitters = RunSpec("hitter", "bat_speed", None, (2026,))
+    hitter_run = save_run(connection, hitters, FIT, paths([1]))
+
+    assert latest_run(connection, PITCHER_SPEC).run_id == newest
+    assert latest_run(connection, hitters).run_id == hitter_run
+    with pytest.raises(LookupError, match="No pitcher run"):
+        latest_run(connection, RunSpec("pitcher", "release_speed", "SL", ()))
+
+
+def test_load_alert_states_joins_names_and_skips_unscored_rows(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    scored = save_run(connection, PITCHER_SPEC, FIT, paths([554430, 650911]))
+    unscored = save_run(
+        connection,
+        PITCHER_SPEC,
+        FIT,
+        paths([554430]).drop("filtered_gap_mean", "filtered_gap_sd", "alert_z"),
+    )
+
+    states = load_alert_states(connection, scored)
+
+    assert states["full_name"].to_list() == ["Zack Wheeler", "Cristopher Sánchez"]
+    assert states["alert_z"].to_list() == [-2.4, -2.4]
+    assert load_alert_states(connection, unscored).is_empty()
