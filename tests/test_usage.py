@@ -37,6 +37,23 @@ def test_relative_usage_scores_against_earlier_games_only() -> None:
     assert scored["rest_days"].to_list() == [None, *rests[1:]]
 
 
+def test_relative_usage_treats_identical_history_as_no_spread() -> None:
+    rests = [0, 5, 5, 5, 5, 5, 5, 5, 4]
+    days = np.cumsum(rests).tolist()
+    usage = pl.DataFrame(
+        {
+            "player_id": [1] * len(days),
+            "game_date": [date(2026, 4, 1) + timedelta(days=d) for d in days],
+            "pitches": [90] * len(days),
+        }
+    )
+
+    scored = relative_usage(usage)
+
+    assert scored["rest_z"].null_count() == len(days)
+    assert scored["pitches_z"].null_count() == len(days)
+
+
 def logistic_data(seed: int, players: int = 400) -> pl.DataFrame:
     """Games where workload and a velocity drop both raise injury odds."""
     rng = np.random.default_rng(seed)

@@ -14,6 +14,7 @@ import polars as pl
 
 MIN_HISTORY: Final = 5
 MAX_REST_DAYS: Final = 30
+MIN_VARIANCE: Final = 1e-6
 
 USAGE_SQL: Final = """
 SELECT p.pitcher_id AS player_id, g.game_date, count(*) AS pitches
@@ -45,8 +46,11 @@ def _prior_z(column: str) -> pl.Expr:
     """Z-score of a value against the same player's earlier values.
 
     Uses running sums of the previous values, so nothing from the current or
-    later games leaks in. Null until ``MIN_HISTORY`` earlier values exist or
-    when they have no spread.
+    later games leaks in. Null until ``MIN_HISTORY`` earlier values exist, or
+    when they have no real spread: running sums of identical floats leave a
+    variance near 1e-16 instead of 0, which would turn a one-day change in
+    rest into a z-score in the millions, so anything below ``MIN_VARIANCE``
+    counts as no spread.
     """
     value = pl.col(column)
     count = value.shift(1).cum_count().over("player_id")
@@ -55,7 +59,7 @@ def _prior_z(column: str) -> pl.Expr:
     mean = total / count
     variance = (squares - count * mean.pow(2)) / (count - 1)
     return (
-        pl.when((count >= MIN_HISTORY) & (variance > 0))
+        pl.when((count >= MIN_HISTORY) & (variance > MIN_VARIANCE))
         .then((value - mean) / variance.sqrt())
         .otherwise(None)
     )
