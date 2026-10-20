@@ -258,11 +258,31 @@ def test_trajectory_then_chart_end_to_end(
         ["trajectory", "pitcher", "--season", "2026", "--settings", str(settings_path)],
     )
     drawn = runner.invoke(
-        cli.app, ["chart", "zack wheeler", "--settings", str(settings_path)]
+        cli.app,
+        [
+            "chart",
+            "zack wheeler",
+            "--pitch-type",
+            "FF",
+            "--settings",
+            str(settings_path),
+        ],
+    )
+    missing = runner.invoke(
+        cli.app,
+        [
+            "chart",
+            "zack wheeler",
+            "--pitch-type",
+            "SI",
+            "--settings",
+            str(settings_path),
+        ],
     )
 
     assert stored.exit_code == 0, stored.output
     assert drawn.exit_code == 0, drawn.output
+    assert missing.exit_code == 1
     figures = output_dir / "outputs" / "figures"
     assert (figures / "zack_wheeler_ff_release_speed.png").exists()
     assert (figures / "league_seasonal_ff_release_speed.png").exists()

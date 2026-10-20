@@ -27,6 +27,12 @@ DOT_AREA_PER_PITCH: Final = 0.9
 DOT_AREA_MAX: Final = 90.0
 Y_PADDING_FRACTION: Final = 0.06
 
+FOOTNOTE: Final = (
+    "Hindsight talent uses every game; the real-time estimate uses only games "
+    "played so far. The league seasonal curve is removed from all values.\n"
+    "Game averages also carry one-day noise that the intervals exclude."
+)
+
 METRIC_LABELS: Final[dict[str, tuple[str, str]]] = {
     "release_speed": ("velocity", "mph"),
     "spin_rate": ("spin rate", "rpm"),
@@ -300,16 +306,15 @@ def plot_talent_fan(trajectory: pl.DataFrame, labels: ChartLabels) -> Figure:
         )
         figure.text(
             0.012,
-            0.02,
-            "Hindsight talent uses every game; the real-time estimate uses only "
-            "games played so far. The league seasonal curve is removed from all "
-            "values; game averages also carry one-day noise the intervals exclude.",
+            0.018,
+            FOOTNOTE,
             fontsize=8.5,
             color=theme.INK_MUTED,
             va="bottom",
+            linespacing=1.4,
         )
         figure.subplots_adjust(
-            left=0.055, right=0.93, top=0.74, bottom=0.13, wspace=0.04
+            left=0.055, right=0.93, top=0.74, bottom=0.155, wspace=0.07
         )
     return figure
 

@@ -19,6 +19,7 @@ FROM model_run AS r
 LEFT JOIN pitch_type AS pt ON pt.code = r.pitch_type
 WHERE r.role = $role
   AND ($metric IS NULL OR r.metric = $metric)
+  AND ($pitch_type IS NULL OR r.pitch_type = $pitch_type)
   AND EXISTS (
       SELECT 1 FROM latent_state AS s
       WHERE s.run_id = r.run_id AND s.player_id = $player_id
@@ -169,14 +170,16 @@ def latest_run_for_player(
     player_id: int,
     role: str,
     metric: str | None = None,
+    pitch_type: str | None = None,
 ) -> RunInfo:
-    """Find the most recent run of a role (and metric) that includes a player.
+    """Find the most recent run of a role that includes a player.
 
     Args:
         connection: Warehouse connection.
         player_id: MLBAM player id.
         role: ``pitcher`` or ``hitter``.
         metric: Restrict to this metric, or ``None`` for any.
+        pitch_type: Restrict to this pitch type, or ``None`` for any.
 
     Returns:
         The run's identifier and what it was fitted to.
@@ -184,9 +187,13 @@ def latest_run_for_player(
     Raises:
         LookupError: If no stored run includes the player.
     """
-    row = connection.execute(
-        LATEST_RUN_SQL, {"role": role, "metric": metric, "player_id": player_id}
-    ).fetchone()
+    parameters = {
+        "role": role,
+        "metric": metric,
+        "pitch_type": pitch_type,
+        "player_id": player_id,
+    }
+    row = connection.execute(LATEST_RUN_SQL, parameters).fetchone()
     if row is None:
         raise LookupError(f"No {role} run includes player {player_id}")
     run_id, run_role, run_metric, pitch_type, pitch_name = row

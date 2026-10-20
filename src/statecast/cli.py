@@ -55,6 +55,9 @@ SeasonsOption = Annotated[
 ]
 MetricOption = Annotated[str | None, typer.Option(help="Metric column.")]
 PitchTypeOption = Annotated[str, typer.Option(help="Pitch type (pitchers).")]
+AnyPitchTypeOption = Annotated[
+    str | None, typer.Option(help="Pitch type, such as FF; any when omitted.")
+]
 
 
 def _load_or_exit(settings_path: Path) -> Settings:
@@ -271,14 +274,20 @@ def chart(
     player: Annotated[str, typer.Argument(help="Player's full name.")],
     role: Annotated[Role, typer.Option(help="Which run to draw from.")] = Role.PITCHER,
     metric: MetricOption = None,
+    pitch_type: AnyPitchTypeOption = None,
     settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
 ) -> None:
-    """Draw a player's talent fan chart from the latest stored run.
+    """Draw a player's talent fan chart from the latest matching stored run.
+
+    Without ``--metric`` or ``--pitch-type`` the newest run that includes the
+    player wins, so pass ``--pitch-type`` to pick between a pitcher's FF and
+    SI runs.
 
     Args:
         player: Full name, such as ``Zack Wheeler`` (case and accents ignored).
         role: ``pitcher`` or ``hitter``.
         metric: Metric column; any metric when omitted.
+        pitch_type: Pitch-type code; any pitch type when omitted.
         settings_path: Path to ``settings.toml``.
 
     Raises:
@@ -288,7 +297,7 @@ def chart(
     with duckdb.connect(str(settings.paths.warehouse_path), read_only=True) as con:
         try:
             player_id, full_name = find_player(con, player)
-            run = latest_run_for_player(con, player_id, role, metric)
+            run = latest_run_for_player(con, player_id, role, metric, pitch_type)
         except LookupError as error:
             logger.error("%s; run `statecast trajectory` first if needed", error)
             raise typer.Exit(code=1) from error

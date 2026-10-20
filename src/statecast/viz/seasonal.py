@@ -15,6 +15,8 @@ from statecast.viz import theme
 REFERENCE_MARCH_FIRST: Final = date(2026, 3, 1)
 FIGURE_WIDTH_IN: Final = 8.0
 FIGURE_HEIGHT_IN: Final = 4.6
+BOTTOM_PADDING_FRACTION: Final = 0.08
+TOP_PADDING_FRACTION: Final = 0.2
 
 
 def seasonal_knots(summary: pl.DataFrame) -> pl.DataFrame:
@@ -59,6 +61,14 @@ def seasonal_knots(summary: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _y_limits(knots: pl.DataFrame) -> tuple[float, float]:
+    """Y-range covering every interval and zero, with room above for labels."""
+    low = min(float(knots["lower_95"].min()), 0.0)  # type: ignore[arg-type]
+    high = max(float(knots["upper_95"].max()), 0.0)  # type: ignore[arg-type]
+    span = (high - low) or 1.0
+    return low - BOTTOM_PADDING_FRACTION * span, high + TOP_PADDING_FRACTION * span
+
+
 def plot_seasonal_curve(summary: pl.DataFrame, title: str, subtitle: str) -> Figure:
     """Draw the fitted league seasonal curve with 95% intervals at each knot.
 
@@ -98,19 +108,20 @@ def plot_seasonal_curve(summary: pl.DataFrame, title: str, subtitle: str) -> Fig
         axes.annotate(
             "July 1 anchor",
             (dates[ANCHOR_INDEX], 0.0),
-            xytext=(0, -16),
+            xytext=(0, 9),
             textcoords="offset points",
             ha="center",
+            va="bottom",
             fontsize=9,
             color=theme.INK_SECONDARY,
         )
         axes.annotate(
-            f"{estimate[0]:+.2f}",
+            f"{estimate[0]:+.2f}".replace("-", "\N{MINUS SIGN}"),
             (dates[0], estimate[0]),
-            xytext=(-10, 0),
+            xytext=(9, -3),
             textcoords="offset points",
-            ha="right",
-            va="center",
+            ha="left",
+            va="top",
             fontsize=10,
             fontweight="bold",
             color=theme.INK_PRIMARY,
@@ -120,6 +131,7 @@ def plot_seasonal_curve(summary: pl.DataFrame, title: str, subtitle: str) -> Fig
         axes.set_xlim(
             dates[0] - np.timedelta64(12, "D"), dates[-1] + np.timedelta64(5, "D")
         )
+        axes.set_ylim(*_y_limits(knots))
         axes.grid(axis="y")
         axes.set_axisbelow(True)
         for side in ("top", "right", "left"):

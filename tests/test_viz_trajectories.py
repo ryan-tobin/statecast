@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+from matplotlib.figure import Figure
 
 from statecast.viz.seasonal import plot_seasonal_curve, seasonal_knots
 from statecast.viz.trajectories import (
@@ -13,6 +14,20 @@ from statecast.viz.trajectories import (
     save_figure,
     season_span,
 )
+
+
+def assert_text_inside(figure: Figure) -> None:
+    """Every piece of text, including annotations, lies within the figure."""
+    figure.draw_without_rendering()
+    bounds = figure.bbox
+    texts = [*figure.texts, *(text for axes in figure.axes for text in axes.texts)]
+    for text in texts:
+        extent = text.get_window_extent()
+        label = text.get_text()
+        assert extent.x0 >= bounds.x0, label
+        assert extent.x1 <= bounds.x1, label
+        assert extent.y0 >= bounds.y0, label
+        assert extent.y1 <= bounds.y1, label
 
 
 def two_season_trajectory() -> pl.DataFrame:
@@ -72,6 +87,7 @@ def test_plot_talent_fan_draws_one_panel_per_season(output_dir: Path) -> None:
     assert len(figure.axes) == 2
     assert [axes.get_title(loc="left") for axes in figure.axes] == ["2025", "2026"]
     assert path.stat().st_size > 10_000
+    assert_text_inside(figure)
 
 
 def test_plot_talent_fan_rejects_empty_trajectory() -> None:
@@ -110,6 +126,17 @@ def test_plot_seasonal_curve_saves(output_dir: Path) -> None:
 
     assert len(figure.axes) == 1
     assert path.stat().st_size > 10_000
+    assert_text_inside(figure)
+
+
+def test_plot_seasonal_curve_leaves_room_for_the_anchor_label() -> None:
+    figure = plot_seasonal_curve(fit_summary(), "League seasonal curve", "mph")
+
+    low, high = figure.axes[0].get_ylim()
+
+    top_of_intervals, bottom_of_intervals = 0.07, -0.23
+    assert high - top_of_intervals > 0.1 * (top_of_intervals - bottom_of_intervals)
+    assert low < bottom_of_intervals
 
 
 def test_season_span() -> None:

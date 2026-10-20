@@ -151,6 +151,21 @@ def test_latest_run_for_player_picks_newest_matching_run(
     assert velocity.metric == "release_speed"
 
 
+def test_latest_run_for_player_filters_by_pitch_type(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    fastball = save_run(connection, PITCHER_SPEC, FIT, paths([554430]))
+    sinker = RunSpec("pitcher", "release_speed", "SI", (2025, 2026))
+    newest = save_run(connection, sinker, FIT, paths([554430]))
+
+    any_pitch = latest_run_for_player(connection, 554430, "pitcher")
+    four_seam = latest_run_for_player(connection, 554430, "pitcher", None, "FF")
+
+    assert any_pitch.run_id == newest
+    assert four_seam.run_id == fastball
+    assert four_seam.pitch_type == "FF"
+
+
 def test_latest_run_for_player_requires_a_run(
     connection: duckdb.DuckDBPyConnection,
 ) -> None:
