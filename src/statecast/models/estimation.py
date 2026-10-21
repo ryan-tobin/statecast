@@ -1,5 +1,6 @@
 """Maximum-likelihood estimation of population parameters with L-BFGS."""
 
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import jax
@@ -34,6 +35,57 @@ PARAMETER_NAMES = (
 LOG_SCALE = (True, True, True, False, True, True, *([False] * FREE_KNOT_COUNT))
 MEAN_INDEX = PARAMETER_NAMES.index("population_mean")
 KNOT_SLICE = slice(6, 6 + FREE_KNOT_COUNT)
+
+
+class OptimizerCoordinates(NamedTuple):
+    """Affine map from the unconstrained vector to the optimizer's coordinates.
+
+    The optimizer works on ``(raw - shift) / scale``.
+
+    Attributes:
+        shift: Subtracted from each unconstrained parameter.
+        scale: Then divided into it.
+    """
+
+    shift: Array
+    scale: Array
+
+
+class Minimum(NamedTuple):
+    """Where L-BFGS stopped.
+
+    Attributes:
+        raw: Minimizer on the unconstrained scale.
+        iterations: Iterations used.
+        gradient_norm: Final gradient norm in optimizer coordinates.
+    """
+
+    raw: Array
+    iterations: Array
+    gradient_norm: Array
+
+
+class DerivedQuantity(NamedTuple):
+    """A positive quantity whose log is linear in the unconstrained vector.
+
+    ``log(value) = offset + sum(weight * raw[index])``, so its delta-method
+    interval on the log scale is exact.
+
+    Attributes:
+        name: Row name in the parameter table.
+        offset: Constant term of the log.
+        weights: ``(index, weight)`` pairs of the linear term.
+    """
+
+    name: str
+    offset: float
+    weights: tuple[tuple[int, float], ...]
+
+
+OU_DERIVED = (
+    DerivedQuantity("half_life_days", float(np.log(np.log(2.0))), ((0, -1.0),)),
+    DerivedQuantity("stationary_sd", float(-0.5 * np.log(2.0)), ((0, -0.5), (1, 1.0))),
+)
 
 
 class FitResult(NamedTuple):
@@ -96,7 +148,7 @@ def initial_guess(batch: ObservationBatch) -> PopulationParams:
     )
 
 
-def optimizer_coordinates(batch: ObservationBatch) -> tuple[Array, Array]:
+def optimizer_coordinates(batch: ObservationBatch) -> OptimizerCoordinates:
     """Shift and scale that put the mean and seasonal knots in pooled-sd units.
 
     The optimizer works on ``(raw - shift) / scale``. Log-scale parameters are
@@ -109,7 +161,7 @@ def optimizer_coordinates(batch: ObservationBatch) -> tuple[Array, Array]:
         batch: Padded appearances.
 
     Returns:
-        ``(shift, scale)``, each the length of the unconstrained vector.
+        ``shift`` and ``scale``, each the length of the unconstrained vector.
     """
     weights = jnp.where(batch.mask, batch.sample_size, 0.0)
     total = jnp.sum(weights)
@@ -120,7 +172,67 @@ def optimizer_coordinates(batch: ObservationBatch) -> tuple[Array, Array]:
     size = len(PARAMETER_NAMES)
     shift = jnp.zeros(size).at[MEAN_INDEX].set(center)
     scale = jnp.ones(size).at[MEAN_INDEX].set(spread).at[KNOT_SLICE].set(spread)
-    return shift, scale
+    return OptimizerCoordinates(shift=shift, scale=scale)
+
+
+def minimize(
+    objective: Callable[[Array], Array],
+    start: Array,
+    coordinates: OptimizerCoordinates,
+    max_iterations: int,
+    tolerance: float,
+) -> Minimum:
+    """Minimize a smooth objective with L-BFGS in rescaled coordinates.
+
+    Args:
+        objective: Function of the unconstrained vector, ideally of order one.
+        start: Starting point on the unconstrained scale.
+        coordinates: Shift and scale defining the optimizer's coordinates.
+        max_iterations: Iteration cap.
+        tolerance: Stop when the gradient norm (in optimizer coordinates)
+            falls below this.
+
+    Returns:
+        The minimizer on the unconstrained scale and convergence diagnostics.
+
+    Example:
+        >>> coordinates = OptimizerCoordinates(jnp.zeros(2), jnp.ones(2))
+        >>> result = minimize(lambda x: jnp.sum((x - 3.0) ** 2), jnp.zeros(2),
+        ...                   coordinates, 50, 1e-10)
+        >>> [round(float(value), 6) for value in result.raw]
+        [3.0, 3.0]
+    """
+    shift, scale = coordinates
+
+    def scaled_objective(point: Array) -> Array:
+        return objective(shift + scale * point)
+
+    solver = optax.lbfgs()
+    value_and_grad = optax.value_and_grad_from_state(scaled_objective)
+
+    def step(carry: tuple[Array, optax.OptState]) -> tuple[Array, optax.OptState]:
+        point, state = carry
+        value, grad = value_and_grad(point, state=state)
+        updates, state = solver.update(
+            grad, state, point, value=value, grad=grad, value_fn=scaled_objective
+        )
+        return optax.apply_updates(point, updates), state
+
+    def keep_going(carry: tuple[Array, optax.OptState]) -> Array:
+        _, state = carry
+        iteration: Array = otu.tree_get(state, "count")
+        gradient_norm: Array = otu.tree_norm(otu.tree_get(state, "grad"))
+        return (iteration == 0) | (
+            (iteration < max_iterations) & (gradient_norm >= tolerance)
+        )
+
+    initial = (start - shift) / scale
+    point, state = jax.lax.while_loop(keep_going, step, (initial, solver.init(initial)))
+    return Minimum(
+        raw=shift + scale * point,
+        iterations=otu.tree_get(state, "count"),
+        gradient_norm=otu.tree_norm(otu.tree_get(state, "grad")),
+    )
 
 
 def fit_population(
@@ -148,44 +260,72 @@ def fit_population(
         Estimates, their covariance and convergence diagnostics.
     """
     total_count = jnp.sum(jnp.where(batch.mask, batch.sample_size, 0.0))
-    shift, scale = optimizer_coordinates(batch)
 
     def objective(raw: Array) -> Array:
         return -population_log_likelihood(constrain(raw), batch) / total_count
 
-    def scaled_objective(point: Array) -> Array:
-        return objective(shift + scale * point)
-
-    solver = optax.lbfgs()
-    value_and_grad = optax.value_and_grad_from_state(scaled_objective)
-
-    def step(carry: tuple[Array, optax.OptState]) -> tuple[Array, optax.OptState]:
-        point, state = carry
-        value, grad = value_and_grad(point, state=state)
-        updates, state = solver.update(
-            grad, state, point, value=value, grad=grad, value_fn=scaled_objective
-        )
-        return optax.apply_updates(point, updates), state
-
-    def keep_going(carry: tuple[Array, optax.OptState]) -> Array:
-        _, state = carry
-        iteration: Array = otu.tree_get(state, "count")
-        gradient_norm: Array = otu.tree_norm(otu.tree_get(state, "grad"))
-        return (iteration == 0) | (
-            (iteration < max_iterations) & (gradient_norm >= tolerance)
-        )
-
-    start = (unconstrain(initial) - shift) / scale
-    point, state = jax.lax.while_loop(keep_going, step, (start, solver.init(start)))
-    raw = shift + scale * point
-    hessian = jax.hessian(objective)(raw) * total_count
+    found = minimize(
+        objective,
+        unconstrain(initial),
+        optimizer_coordinates(batch),
+        max_iterations,
+        tolerance,
+    )
+    hessian = jax.hessian(objective)(found.raw) * total_count
     return FitResult(
-        params=constrain(raw),
-        unconstrained=raw,
+        params=constrain(found.raw),
+        unconstrained=found.raw,
         unconstrained_cov=jnp.linalg.inv(hessian),
-        log_likelihood=-objective(raw) * total_count,
-        iterations=otu.tree_get(state, "count"),
-        gradient_norm=otu.tree_norm(otu.tree_get(state, "grad")),
+        log_likelihood=-objective(found.raw) * total_count,
+        iterations=found.iterations,
+        gradient_norm=found.gradient_norm,
+    )
+
+
+def parameter_table(
+    raw: Array,
+    cov: Array,
+    names: Sequence[str],
+    log_scale: Sequence[bool],
+    derived: Sequence[DerivedQuantity],
+) -> pl.DataFrame:
+    """Estimates with 95% Wald intervals, plus derived positive quantities.
+
+    Intervals are computed on the unconstrained scale and mapped back, so
+    positive parameters get asymmetric intervals that stay positive.
+
+    Args:
+        raw: Unconstrained estimate.
+        cov: Its covariance.
+        names: Parameter names, in the order of ``raw``.
+        log_scale: True where ``raw`` holds the log of the parameter.
+        derived: Extra rows, each a positive quantity log-linear in ``raw``.
+
+    Returns:
+        Columns ``parameter``, ``estimate``, ``lower_95``, ``upper_95``.
+    """
+    raw_values = np.asarray(raw)
+    covariance = np.asarray(cov)
+    gradients = np.zeros((len(derived), raw_values.size))
+    offsets = np.zeros(len(derived))
+    for row, quantity in enumerate(derived):
+        offsets[row] = quantity.offset
+        for index, weight in quantity.weights:
+            gradients[row, index] = weight
+    derived_se = np.sqrt(np.einsum("ij,jk,ik->i", gradients, covariance, gradients))
+    centers = np.concatenate([raw_values, offsets + gradients @ raw_values])
+    standard_errors = np.concatenate([np.sqrt(np.diag(covariance)), derived_se])
+    is_log = np.array([*log_scale, *([True] * len(derived))])
+    bounds = centers[:, None] + np.array([0.0, -Z_95, Z_95]) * standard_errors[:, None]
+    values = bounds.copy()
+    values[is_log] = np.exp(bounds[is_log])
+    return pl.DataFrame(
+        {
+            "parameter": [*names, *(quantity.name for quantity in derived)],
+            "estimate": values[:, 0],
+            "lower_95": values[:, 1],
+            "upper_95": values[:, 2],
+        }
     )
 
 
@@ -193,12 +333,9 @@ def summarize_fit(fit: FitResult) -> pl.DataFrame:
     """Tabulate estimates with 95% intervals, plus two derived quantities.
 
     Seasonal knots (``season_apr`` and so on) are shifts from the July 1
-    level, in the metric's units.
-
-    Intervals are Wald intervals on the unconstrained scale, mapped back, so
-    positive parameters get asymmetric intervals that stay positive. The talent
-    half-life ``ln 2 / kappa`` and stationary spread ``sigma / sqrt(2 kappa)``
-    follow from their own delta-method intervals on the log scale.
+    level, in the metric's units. The talent half-life ``ln 2 / kappa`` and
+    stationary spread ``sigma / sqrt(2 kappa)`` get delta-method intervals on
+    the log scale.
 
     Args:
         fit: Output of ``fit_population``.
@@ -206,25 +343,6 @@ def summarize_fit(fit: FitResult) -> pl.DataFrame:
     Returns:
         Columns ``parameter``, ``estimate``, ``lower_95``, ``upper_95``.
     """
-    raw = np.asarray(fit.unconstrained)
-    cov = np.asarray(fit.unconstrained_cov)
-    log_half_life = np.log(np.log(2.0)) - raw[0]
-    log_stationary_sd = raw[1] - 0.5 * (np.log(2.0) + raw[0])
-    gradients = np.zeros((2, raw.size))
-    gradients[0, 0] = -1.0
-    gradients[1, :2] = (-0.5, 1.0)
-    derived_se = np.sqrt(np.einsum("ij,jk,ik->i", gradients, cov, gradients))
-    centers = np.concatenate([raw, [log_half_life, log_stationary_sd]])
-    standard_errors = np.concatenate([np.sqrt(np.diag(cov)), derived_se])
-    log_scale = np.array([*LOG_SCALE, True, True])
-    bounds = centers[:, None] + np.array([0.0, -Z_95, Z_95]) * standard_errors[:, None]
-    values = bounds.copy()
-    values[log_scale] = np.exp(bounds[log_scale])
-    return pl.DataFrame(
-        {
-            "parameter": [*PARAMETER_NAMES, "half_life_days", "stationary_sd"],
-            "estimate": values[:, 0],
-            "lower_95": values[:, 1],
-            "upper_95": values[:, 2],
-        }
+    return parameter_table(
+        fit.unconstrained, fit.unconstrained_cov, PARAMETER_NAMES, LOG_SCALE, OU_DERIVED
     )
