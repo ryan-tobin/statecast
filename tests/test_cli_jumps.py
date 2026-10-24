@@ -162,3 +162,54 @@ def test_jumps_exits_nonzero_without_data(
     )
 
     assert result.exit_code == 1
+
+
+def test_jump_alerts_compare_scores_end_to_end(
+    output_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "pitcher_appearances", lambda *args: appearances())
+    monkeypatch.setattr(cli, "fit_population", fake_ou_fit)
+    monkeypatch.setattr(cli, "fit_jump_population", fake_jump_fit)
+    monkeypatch.setattr(cli, "JUMP_FILTER_SETTINGS", FilterSettings(64, 3))
+    settings_path = warehouse_settings(output_dir)
+    with duckdb.connect(str(output_dir / "warehouse.duckdb")) as connection:
+        upsert_table(
+            connection,
+            "player_transaction",
+            pl.DataFrame(
+                {
+                    "transaction_id": [1],
+                    "player_id": [554430],
+                    "transaction_date": [date(2026, 5, 8)],
+                    "effective_date": [date(2026, 5, 8)],
+                    "type_code": ["SC"],
+                    "type_desc": ["Status Change"],
+                    "description": [
+                        "Philadelphia Phillies placed RHP Zack Wheeler on the "
+                        "15-day injured list. Right shoulder fatigue."
+                    ],
+                }
+            ),
+        )
+    season = ["--season", "2026", "--settings", str(settings_path)]
+
+    smoothed = runner.invoke(cli.app, ["trajectory", "pitcher", *season])
+    jumped = runner.invoke(cli.app, ["jumps", "pitcher", *season])
+    compared = runner.invoke(cli.app, ["jump-alerts", "--settings", str(settings_path)])
+
+    assert smoothed.exit_code == 0, smoothed.output
+    assert jumped.exit_code == 0, jumped.output
+    assert compared.exit_code == 0, compared.output
+    assert "AUC against healthy games by score" in compared.output
+    assert "Gain over the smooth alert" in compared.output
+    assert "drop_evidence" in compared.output
+    figures = output_dir / "outputs" / "figures"
+    assert (figures / "jump_alerts_ff_release_speed.png").exists()
+
+
+def test_jump_alerts_exits_nonzero_without_runs(output_dir: Path) -> None:
+    settings_path = warehouse_settings(output_dir)
+
+    result = runner.invoke(cli.app, ["jump-alerts", "--settings", str(settings_path)])
+
+    assert result.exit_code == 1

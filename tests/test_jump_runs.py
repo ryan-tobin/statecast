@@ -19,7 +19,9 @@ from statecast.storage import jump_runs
 from statecast.storage.jump_runs import (
     JUMP_MODEL_NAME,
     JumpRunDetails,
+    latest_jump_run,
     latest_jump_run_for_player,
+    load_jump_states,
     load_jump_trajectory,
     load_player_names,
     save_jump_run,
@@ -209,3 +211,41 @@ def test_load_player_names_returns_int64_ids(
 
     assert names.schema["player_id"] == pl.Int64
     assert sorted(names["full_name"].to_list()) == ["Ranger Suárez", "Zack Wheeler"]
+
+
+def test_latest_jump_run_reads_window_and_jump_size(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    save_jump_run(connection, SPEC, JUMP_FIT, jump_states([554430]), DETAILS)
+    newest = save_jump_run(connection, SPEC, JUMP_FIT, jump_states([650911]), DETAILS)
+
+    summary = latest_jump_run(connection, SPEC)
+
+    assert summary.run.run_id == newest
+    assert summary.run.pitch_name == "4-Seam Fastball"
+    assert summary.recent_window == 3
+    assert summary.jump_mean == pytest.approx(-0.8)
+    assert summary.jump_sd == pytest.approx(1.4)
+    with pytest.raises(LookupError, match="No pitcher jump run"):
+        latest_jump_run(connection, RunSpec("pitcher", "spin_rate", "FF", ()))
+
+
+def test_load_jump_states_skips_runs_without_evidence(
+    connection: duckdb.DuckDBPyConnection,
+) -> None:
+    scored = save_jump_run(
+        connection, SPEC, JUMP_FIT, jump_states([554430, 650911]), DETAILS
+    )
+    unscored = save_jump_run(
+        connection,
+        SPEC,
+        JUMP_FIT,
+        jump_states([554430]).with_columns(jump_evidence=pl.lit(None, pl.Float64)),
+        DETAILS,
+    )
+
+    states = load_jump_states(connection, scored)
+
+    assert states["player_id"].to_list() == [554430, 650911]
+    assert states["recent_drop_prob"].to_list() == [0.2, 0.2]
+    assert load_jump_states(connection, unscored).is_empty()

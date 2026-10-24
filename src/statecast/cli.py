@@ -35,6 +35,11 @@ from statecast.evaluation.jump_report import (
     with_names,
 )
 from statecast.evaluation.metric_scan import METRIC_DIRECTIONS, metric_scan
+from statecast.evaluation.score_comparison import (
+    compare_scores,
+    drop_evidence,
+    drop_share,
+)
 from statecast.evaluation.usage_model import (
     coefficient_table,
     cross_validated_auc,
@@ -64,7 +69,9 @@ from statecast.models.rbpf import FilterSettings, filter_jump_population
 from statecast.models.trajectory import smooth_population, trajectory_frame
 from statecast.storage.jump_runs import (
     JumpRunDetails,
+    latest_jump_run,
     latest_jump_run_for_player,
+    load_jump_states,
     load_jump_trajectory,
     load_player_names,
     save_jump_run,
@@ -84,8 +91,10 @@ from statecast.storage.warehouse import build_warehouse
 from statecast.viz.injury_alerts import plot_event_study
 from statecast.viz.jumps import jump_chart_labels, plot_jump_chart
 from statecast.viz.metric_scan import metric_label, plot_metric_scan
+from statecast.viz.score_comparison import plot_score_comparison
 from statecast.viz.seasonal import plot_seasonal_curve
 from statecast.viz.trajectories import (
+    METRIC_LABELS,
     chart_labels,
     figure_filename,
     plot_talent_fan,
@@ -101,6 +110,11 @@ MIN_MODEL_POSITIVES: Final = 20
 JUMP_FILTER_SETTINGS: Final = FilterSettings(particle_count=512, lag=3)
 JUMP_SEED: Final = 0
 JUMP_REPORT_ROWS: Final = 15
+SCORE_LABELS: Final = {
+    "smooth": "Smooth alert (\N{MINUS SIGN}z)",
+    "drop_prob": "Recent drop probability",
+    "drop_evidence": "Recent drop evidence",
+}
 
 app = typer.Typer(help="statecast data pipeline.", no_args_is_help=True)
 
@@ -769,6 +783,111 @@ def jump_chart(
         f"{full_name} jumps", run.metric, run.pitch_type
     )
     save_figure(plot_jump_chart(path_frame, labels), output)
+    typer.echo(output)
+
+
+def _alert_scores(connection: duckdb.DuckDBPyConnection, spec: RunSpec) -> pl.DataFrame:
+    """Put the smooth alert and both jump alerts side by side for every game.
+
+    Args:
+        connection: Warehouse connection.
+        spec: Role, metric and pitch type of the OU and jump runs.
+
+    Returns:
+        ``player_id``, ``game_date`` and one column per score in
+        ``SCORE_LABELS``, higher meaning a more alarming drop, for the games
+        both runs scored.
+
+    Raises:
+        LookupError: If either run is missing or has no scores.
+    """
+    ou_run = latest_run(connection, spec)
+    smooth = load_alert_states(connection, ou_run.run_id)
+    if smooth.is_empty():
+        raise LookupError(f"Run {ou_run.run_id} has no alert scores")
+    jump_run = latest_jump_run(connection, spec)
+    states = load_jump_states(connection, jump_run.run.run_id)
+    if states.is_empty():
+        raise LookupError(f"Jump run {jump_run.run.run_id} has no jump evidence")
+    share = drop_share(jump_run.jump_mean, jump_run.jump_sd)
+    jumps = states.sort("player_id", "game_date").select(
+        "player_id",
+        "game_date",
+        pl.col("recent_drop_prob").alias("drop_prob"),
+        drop_evidence(jump_run.recent_window, share),
+    )
+    scores = smooth.select("player_id", "game_date", smooth=-pl.col("alert_z")).join(
+        jumps, on=["player_id", "game_date"], how="inner"
+    )
+    logger.info(
+        "Scoring %d games (%d in the OU run, %d in the jump run)",
+        scores.height,
+        smooth.height,
+        jumps.height,
+    )
+    return scores
+
+
+@app.command("jump-alerts")
+def jump_alerts(
+    pitch_type: PitchTypeOption = "FF",
+    metric: PitcherMetricOption = "release_speed",
+    horizon_days: HorizonOption = 30,
+    settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
+) -> None:
+    """Compare jump-based drop alerts with the smooth alert against IL stints.
+
+    Scores every game three ways: the smooth alert (minus the OU alert z), the
+    probability of a recent downward jump, and the evidence for one (its log
+    Bayes factor). Uses the latest OU run and the latest jump run of the
+    metric and pitch type. Prints each score's AUC against healthy games and
+    its arm-minus-lower-body contrast, then each jump score's paired gain over
+    the smooth alert, and draws the comparison chart. Every score treats a
+    drop as alarming.
+
+    Args:
+        pitch_type: Pitch type of the runs, such as ``FF``.
+        metric: Pitcher metric of the runs, such as ``release_speed``.
+        horizon_days: Days after a game that count as before an IL stint.
+        settings_path: Path to ``settings.toml``.
+
+    Raises:
+        typer.Exit: With code 1 if either run is missing or unscored.
+    """
+    settings = _load_or_exit(settings_path)
+    spec = RunSpec(Role.PITCHER, metric, pitch_type, ())
+    with duckdb.connect(str(settings.paths.warehouse_path), read_only=True) as con:
+        try:
+            scores = _alert_scores(con, spec)
+        except LookupError as error:
+            logger.error("%s; run `statecast trajectory` and `jumps` first", error)
+            raise typer.Exit(code=1) from error
+        placements = il_placements(con)
+        pitch_name = (pitch_type_name(con, pitch_type) or pitch_type).lower()
+    labeled = label_appearances(scores, placements)
+    comparison = compare_scores(labeled, list(SCORE_LABELS), horizon_days)
+    _echo_section(
+        "AUC against healthy games by score (95% pitcher-bootstrap intervals; "
+        "p_holm across the arm - lower_body rows)",
+        comparison.aucs,
+    )
+    _echo_section(
+        "Gain over the smooth alert (paired bootstrap, Holm-adjusted)",
+        comparison.gains,
+    )
+    seasons = sorted(set(scores["game_date"].dt.year().to_list()))
+    metric_name = METRIC_LABELS.get(metric, (metric.replace("_", " "), ""))[0]
+    subtitle = (
+        f"{pitch_name.capitalize()} {metric_name}, {season_span(seasons)} regular "
+        f"season, IL placement within {horizon_days} days"
+    )
+    figure = plot_score_comparison(
+        comparison.aucs, SCORE_LABELS, "Do sudden drops warn of injuries?", subtitle
+    )
+    output = settings.paths.figures_dir / figure_filename(
+        "jump alerts", metric, pitch_type
+    )
+    save_figure(figure, output)
     typer.echo(output)
 
 

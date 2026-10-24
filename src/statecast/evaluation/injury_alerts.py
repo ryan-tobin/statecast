@@ -155,13 +155,32 @@ def weighted_auc(
         1.0
     """
     values, bins = np.unique(scores, return_inverse=True)
-    return _binned_auc(bins, values.size, positive, weights)
+    return binned_auc(bins, values.size, positive, weights)
 
 
-def _binned_auc(
+def binned_auc(
     bins: np.ndarray, bin_count: int, positive: np.ndarray, weights: np.ndarray
 ) -> float:
-    """AUC from scores already replaced by their rank among unique values."""
+    """Weighted AUC from scores already replaced by their rank.
+
+    Replacing scores by their index among the sorted unique values once lets
+    many bootstrap reweightings reuse the same sort.
+
+    Args:
+        bins: Each observation's index among the sorted unique scores.
+        bin_count: Number of unique scores.
+        positive: True for positives.
+        weights: Non-negative weight per observation.
+
+    Returns:
+        The AUC, with ties counted as half, or NaN if either class has no
+        weight.
+
+    Example:
+        >>> binned_auc(np.array([1, 0, 1, 0]), 2,
+        ...            np.array([True, False, True, False]), np.ones(4))
+        1.0
+    """
     positive_weight = np.bincount(bins, weights * positive, minlength=bin_count)
     negative_weight = np.bincount(bins, weights * ~positive, minlength=bin_count)
     total_positive = positive_weight.sum()
@@ -240,7 +259,7 @@ def auc_table(
 
     def aucs(weights: np.ndarray) -> dict[tuple[str, str], float]:
         return {
-            key: _binned_auc(bins, values.size, mask, weights * (mask | ~in_window))
+            key: binned_auc(bins, values.size, mask, weights * (mask | ~in_window))
             for key, mask in positives.items()
         }
 

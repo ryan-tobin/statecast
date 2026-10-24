@@ -40,6 +40,32 @@ ORDER BY game_date
 
 PLAYER_NAMES_SQL = "SELECT player_id, full_name FROM player"
 
+LATEST_JUMP_POPULATION_SQL = """
+SELECT r.run_id, r.role, r.metric, r.pitch_type, pt.name, j.recent_window,
+       max(p.estimate) FILTER (WHERE p.parameter = 'jump_mean') AS jump_mean,
+       max(p.estimate) FILTER (WHERE p.parameter = 'jump_sd') AS jump_sd
+FROM model_run AS r
+JOIN jump_run AS j USING (run_id)
+JOIN model_parameter AS p USING (run_id)
+LEFT JOIN pitch_type AS pt ON pt.code = r.pitch_type
+WHERE r.model_name = $model_name
+  AND r.role = $role
+  AND r.metric = $metric
+  AND r.pitch_type IS NOT DISTINCT FROM $pitch_type
+GROUP BY ALL
+ORDER BY max(r.created_at) DESC
+LIMIT 1
+"""
+
+JUMP_STATES_SQL = """
+SELECT player_id, game_date, prior_jump_prob, jump_prob, jump_evidence,
+       recent_jump_prob, recent_drop_prob
+FROM jump_state
+WHERE run_id = $run_id
+  AND jump_evidence IS NOT NULL
+ORDER BY player_id, game_date
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class JumpRunDetails:
@@ -57,6 +83,23 @@ class JumpRunDetails:
     particle_log_likelihood: float
     settings: FilterSettings
     seed: int
+
+
+@dataclass(frozen=True, slots=True)
+class JumpRunSummary:
+    """A stored jump run and what scoring its output needs.
+
+    Attributes:
+        run: The run's identifier and what it was fitted to.
+        recent_window: Appearances in the filter's recent window.
+        jump_mean: Fitted mean jump size.
+        jump_sd: Fitted spread of jump sizes.
+    """
+
+    run: RunInfo
+    recent_window: int
+    jump_mean: float
+    jump_sd: float
 
 
 def save_jump_run(
@@ -180,3 +223,60 @@ def load_player_names(connection: duckdb.DuckDBPyConnection) -> pl.DataFrame:
         .pl()
         .with_columns(pl.col("player_id").cast(pl.Int64))
     )
+
+
+def latest_jump_run(
+    connection: duckdb.DuckDBPyConnection, spec: RunSpec
+) -> JumpRunSummary:
+    """Find the most recent jump run fitted to one population.
+
+    ``spec.seasons`` is ignored; the newest jump run of the role, metric and
+    pitch type wins.
+
+    Args:
+        connection: Warehouse connection.
+        spec: Role, metric and pitch type to match.
+
+    Returns:
+        The run, its recent-window length and its fitted jump size.
+
+    Raises:
+        LookupError: If no stored jump run matches.
+    """
+    parameters = {
+        "model_name": JUMP_MODEL_NAME,
+        "role": spec.role,
+        "metric": spec.metric,
+        "pitch_type": spec.pitch_type,
+    }
+    row = connection.execute(LATEST_JUMP_POPULATION_SQL, parameters).fetchone()
+    if row is None:
+        raise LookupError(
+            f"No {spec.role} jump run of {spec.metric} for pitch type {spec.pitch_type}"
+        )
+    run_id, role, metric, pitch_type, pitch_name, window, mean, sd = row
+    return JumpRunSummary(
+        run=RunInfo(run_id, role, metric, pitch_type, pitch_name),
+        recent_window=int(window),
+        jump_mean=float(mean),
+        jump_sd=float(sd),
+    )
+
+
+def load_jump_states(
+    connection: duckdb.DuckDBPyConnection, run_id: uuid.UUID
+) -> pl.DataFrame:
+    """Read every player-game's jump probabilities and evidence from a run.
+
+    Runs stored before jump evidence was recorded return no rows.
+
+    Args:
+        connection: Warehouse connection.
+        run_id: Run identifier.
+
+    Returns:
+        ``player_id``, ``game_date``, ``prior_jump_prob``, ``jump_prob``,
+        ``jump_evidence``, ``recent_jump_prob`` and ``recent_drop_prob``, by
+        player and date.
+    """
+    return connection.execute(JUMP_STATES_SQL, {"run_id": str(run_id)}).pl()
