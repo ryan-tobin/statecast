@@ -4,9 +4,11 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 import duckdb
 import polars as pl
+from jax import Array
 
 from statecast.models.estimation import FitResult, summarize_fit
 from statecast.storage.warehouse import initialize_schema, upsert_table
@@ -41,7 +43,8 @@ LATEST_POPULATION_RUN_SQL = """
 SELECT r.run_id, r.role, r.metric, r.pitch_type, pt.name
 FROM model_run AS r
 LEFT JOIN pitch_type AS pt ON pt.code = r.pitch_type
-WHERE r.role = $role
+WHERE r.model_name = $model_name
+  AND r.role = $role
   AND r.metric = $metric
   AND r.pitch_type IS NOT DISTINCT FROM $pitch_type
 ORDER BY r.created_at DESC
@@ -107,6 +110,57 @@ class PlayerLookupError(LookupError):
     """Raised when a player name matches no player or several players."""
 
 
+class FitDiagnostics(Protocol):
+    """What every fit result reports about its optimization."""
+
+    @property
+    def log_likelihood(self) -> Array:
+        """Maximized total log-likelihood."""
+        ...
+
+    @property
+    def iterations(self) -> Array:
+        """Optimizer iterations used."""
+        ...
+
+
+def model_run_row(
+    run_id: uuid.UUID,
+    spec: RunSpec,
+    model_name: str,
+    states: pl.DataFrame,
+    fit: FitDiagnostics,
+) -> pl.DataFrame:
+    """Build the ``model_run`` row describing a fitted run.
+
+    Args:
+        run_id: New run identifier.
+        spec: What the run was fitted to.
+        model_name: Model version, such as ``ou_day_effect_seasonal``.
+        states: Per-appearance output; one row per player-game.
+        fit: The fit's log-likelihood and iteration count.
+
+    Returns:
+        A one-row frame matching the ``model_run`` table.
+    """
+    return pl.DataFrame(
+        {
+            "run_id": [str(run_id)],
+            "created_at": [datetime.now(tz=UTC)],
+            "model_name": [model_name],
+            "role": [spec.role],
+            "metric": [spec.metric],
+            "pitch_type": [spec.pitch_type],
+            "seasons": [list(spec.seasons)],
+            "player_count": [states["player_id"].n_unique()],
+            "appearance_count": [states.height],
+            "log_likelihood": [float(fit.log_likelihood)],
+            "iterations": [int(fit.iterations)],
+        },
+        schema_overrides={"seasons": pl.List(pl.Int16), "pitch_type": pl.String},
+    )
+
+
 def save_run(
     connection: duckdb.DuckDBPyConnection,
     spec: RunSpec,
@@ -131,22 +185,7 @@ def save_run(
         duckdb.Error: If any write fails (the transaction is rolled back).
     """
     run_id = uuid.uuid4()
-    run = pl.DataFrame(
-        {
-            "run_id": [str(run_id)],
-            "created_at": [datetime.now(tz=UTC)],
-            "model_name": [MODEL_NAME],
-            "role": [spec.role],
-            "metric": [spec.metric],
-            "pitch_type": [spec.pitch_type],
-            "seasons": [list(spec.seasons)],
-            "player_count": [trajectories["player_id"].n_unique()],
-            "appearance_count": [trajectories.height],
-            "log_likelihood": [float(fit.log_likelihood)],
-            "iterations": [int(fit.iterations)],
-        },
-        schema_overrides={"seasons": pl.List(pl.Int16), "pitch_type": pl.String},
-    )
+    run = model_run_row(run_id, spec, MODEL_NAME, trajectories, fit)
     parameters = summarize_fit(fit).with_columns(run_id=pl.lit(str(run_id)))
     states = trajectories.with_columns(run_id=pl.lit(str(run_id)))
     initialize_schema(connection)
@@ -260,8 +299,9 @@ def pitch_type_name(
 def latest_run(connection: duckdb.DuckDBPyConnection, spec: RunSpec) -> RunInfo:
     """Find the most recent run fitted to one population, whoever is in it.
 
-    ``spec.seasons`` is ignored; the newest run of the role, metric and pitch
-    type wins.
+    Only runs of the OU model (``MODEL_NAME``) count, since the alert tables
+    read their ``latent_state`` rows. ``spec.seasons`` is ignored; the newest
+    run of the role, metric and pitch type wins.
 
     Args:
         connection: Warehouse connection.
@@ -274,6 +314,7 @@ def latest_run(connection: duckdb.DuckDBPyConnection, spec: RunSpec) -> RunInfo:
         LookupError: If no stored run matches.
     """
     parameters = {
+        "model_name": MODEL_NAME,
         "role": spec.role,
         "metric": spec.metric,
         "pitch_type": spec.pitch_type,

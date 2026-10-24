@@ -157,6 +157,31 @@ CREATE TABLE IF NOT EXISTS latent_state (
     PRIMARY KEY (run_id, player_id, game_date)
 );
 
+CREATE TABLE IF NOT EXISTS jump_run (
+    run_id UUID PRIMARY KEY,
+    ou_log_likelihood DOUBLE NOT NULL,
+    particle_log_likelihood DOUBLE NOT NULL,
+    particle_count INTEGER NOT NULL,
+    recent_window SMALLINT NOT NULL,
+    seed INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jump_state (
+    run_id UUID,
+    player_id INTEGER,
+    game_date DATE,
+    sample_size INTEGER NOT NULL,
+    appearance_mean DOUBLE NOT NULL,
+    seasonal_effect DOUBLE NOT NULL,
+    talent_mean DOUBLE NOT NULL,
+    talent_sd DOUBLE NOT NULL,
+    jump_prob DOUBLE NOT NULL,
+    recent_jump_prob DOUBLE NOT NULL,
+    recent_drop_prob DOUBLE NOT NULL,
+    effective_size DOUBLE NOT NULL,
+    PRIMARY KEY (run_id, player_id, game_date)
+);
+
 -- Migration for warehouses created before the seasonal curve: older runs had
 -- no seasonal shift, so zero is their correct value.
 ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS seasonal_effect DOUBLE DEFAULT 0.0;

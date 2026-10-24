@@ -1,4 +1,4 @@
-"""Command-line interface: ingest, load, fit, trajectory, chart, alerts and scan."""
+"""Command-line interface: data, talent fits, injury alerts and jump detection."""
 
 import asyncio
 import logging
@@ -27,6 +27,12 @@ from statecast.evaluation.injury_alerts import (
     relative_to_healthy,
     threshold_table,
 )
+from statecast.evaluation.jump_report import (
+    current_drops,
+    likeliest_jumps,
+    model_comparison,
+    with_names,
+)
 from statecast.evaluation.metric_scan import METRIC_DIRECTIONS, metric_scan
 from statecast.evaluation.usage_model import (
     coefficient_table,
@@ -44,8 +50,24 @@ from statecast.models.estimation import (
     initial_guess,
     summarize_fit,
 )
+from statecast.models.jump_trajectory import jump_trajectory_frame
+from statecast.models.jumps import (
+    JumpFitResult,
+    JumpModel,
+    fit_jump_population,
+    initial_jump_model,
+    summarize_jump_fit,
+)
 from statecast.models.kalman import ObservationBatch, batch_from_frame
+from statecast.models.rbpf import FilterSettings, filter_jump_population
 from statecast.models.trajectory import smooth_population, trajectory_frame
+from statecast.storage.jump_runs import (
+    JumpRunDetails,
+    latest_jump_run_for_player,
+    load_jump_trajectory,
+    load_player_names,
+    save_jump_run,
+)
 from statecast.storage.model_runs import (
     RunInfo,
     RunSpec,
@@ -59,6 +81,7 @@ from statecast.storage.model_runs import (
 )
 from statecast.storage.warehouse import build_warehouse
 from statecast.viz.injury_alerts import plot_event_study
+from statecast.viz.jumps import jump_chart_labels, plot_jump_chart
 from statecast.viz.metric_scan import metric_label, plot_metric_scan
 from statecast.viz.seasonal import plot_seasonal_curve
 from statecast.viz.trajectories import (
@@ -74,6 +97,9 @@ logger = logging.getLogger(__name__)
 ALERT_THRESHOLDS: Final = (1.0, 1.5, 2.0, 2.5, 3.0)
 CURRENT_ALERT_THRESHOLD: Final = 2.0
 MIN_MODEL_POSITIVES: Final = 20
+JUMP_FILTER_SETTINGS: Final = FilterSettings(particle_count=512, lag=3)
+JUMP_SEED: Final = 0
+JUMP_REPORT_ROWS: Final = 15
 
 app = typer.Typer(help="statecast data pipeline.", no_args_is_help=True)
 
@@ -595,6 +621,153 @@ def scan(
     output = settings.paths.figures_dir / figure_filename("metric scan", "", pitch_type)
     figure = plot_metric_scan(table, "Which metrics warn of arm injuries?", subtitle)
     save_figure(figure, output)
+    typer.echo(output)
+
+
+def _fit_jumps(batch: ObservationBatch, ou_fit: FitResult) -> JumpFitResult:
+    """Fit the jump-diffusion model, starting from the OU fit.
+
+    Args:
+        batch: Padded appearances.
+        ou_fit: OU fit to the same data.
+
+    Returns:
+        The jump-diffusion fit.
+    """
+    logger.info("Fitting the jump-diffusion model")
+    result: JumpFitResult = jax.jit(fit_jump_population)(
+        batch, initial_jump_model(ou_fit.params)
+    )
+    logger.info(
+        "Converged in %d iterations (gradient norm %.2e)",
+        int(result.iterations),
+        float(result.gradient_norm),
+    )
+    return result
+
+
+def _filter_jumps(
+    frame: pl.DataFrame, batch: ObservationBatch, model: JumpModel
+) -> tuple[pl.DataFrame, float]:
+    """Run the particle filter over every player.
+
+    Args:
+        frame: The appearances the batch was built from.
+        batch: Padded appearances.
+        model: Fitted jump-diffusion parameters.
+
+    Returns:
+        Per-game output and the filter's total log-likelihood estimate.
+    """
+    logger.info(
+        "Running the particle filter: %d players, %d particles each",
+        batch.mean.shape[0],
+        JUMP_FILTER_SETTINGS.particle_count,
+    )
+    run = jax.jit(filter_jump_population, static_argnames="settings")
+    result = run(model, batch, jax.random.key(JUMP_SEED), JUMP_FILTER_SETTINGS)
+    states = jump_trajectory_frame(frame, batch, model, result)
+    return states, float(result.log_likelihood.sum())
+
+
+@app.command()
+def jumps(
+    role: Role,
+    season: SeasonsOption,
+    metric: MetricOption = None,
+    pitch_type: PitchTypeOption = "FF",
+    settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
+) -> None:
+    """Fit the jump-diffusion model, find likely jumps and store the run.
+
+    Fits the OU model first, as the starting point and the comparison, then
+    the jump model, then runs the particle filter over every player. Prints
+    the parameters, the model comparison, the games most likely to follow a
+    jump, and the players most likely to be in a recent drop at their last
+    game.
+
+    Args:
+        role: ``pitcher`` or ``hitter``.
+        season: Seasons to include (regular season only).
+        metric: Metric column; defaults to release_speed or bat_speed.
+        pitch_type: Pitch type for pitchers, such as ``FF``.
+        settings_path: Path to ``settings.toml``.
+    """
+    settings = _load_or_exit(settings_path)
+    spec = _run_spec(role, season, metric, pitch_type)
+    with duckdb.connect(str(settings.paths.warehouse_path)) as con:
+        frame, batch, ou_fit = _load_and_fit(con, spec)
+        fit = _fit_jumps(batch, ou_fit)
+        states, particle_log_likelihood = _filter_jumps(frame, batch, fit.model)
+        details = JumpRunDetails(
+            ou_log_likelihood=float(ou_fit.log_likelihood),
+            particle_log_likelihood=particle_log_likelihood,
+            settings=JUMP_FILTER_SETTINGS,
+            seed=JUMP_SEED,
+        )
+        run_id = save_jump_run(con, spec, fit, states, details)
+        names = load_player_names(con)
+    _echo_table(summarize_jump_fit(fit))
+    _echo_section(
+        "Model comparison (lower AIC is better)",
+        model_comparison(float(ou_fit.log_likelihood), float(fit.log_likelihood)),
+    )
+    logger.info(
+        "Particle filter log-likelihood %.1f (fitted approximation %.1f)",
+        particle_log_likelihood,
+        float(fit.log_likelihood),
+    )
+    named = with_names(states, names)
+    _echo_section(
+        "Games most likely to follow a jump in talent",
+        likeliest_jumps(named, JUMP_REPORT_ROWS),
+    )
+    _echo_section(
+        "Likeliest recent drops at each player's last game",
+        current_drops(named, JUMP_REPORT_ROWS),
+    )
+    logger.info("Saved jump run %s with %d player-games", run_id, states.height)
+
+
+@app.command("jump-chart")
+def jump_chart(
+    player: Annotated[str, typer.Argument(help="Player's full name.")],
+    role: Annotated[Role, typer.Option(help="Which run to draw from.")] = Role.PITCHER,
+    metric: MetricOption = None,
+    pitch_type: AnyPitchTypeOption = None,
+    settings_path: SettingsOption = DEFAULT_SETTINGS_PATH,
+) -> None:
+    """Draw a player's real-time talent and jump probabilities.
+
+    Uses the latest jump run that includes the player; pass ``--pitch-type``
+    to pick between a pitcher's FF and SI runs.
+
+    Args:
+        player: Full name, such as ``Zack Wheeler`` (case and accents ignored).
+        role: ``pitcher`` or ``hitter``.
+        metric: Metric column; any metric when omitted.
+        pitch_type: Pitch-type code; any pitch type when omitted.
+        settings_path: Path to ``settings.toml``.
+
+    Raises:
+        typer.Exit: With code 1 if the player or a jump run for them is not
+            found.
+    """
+    settings = _load_or_exit(settings_path)
+    with duckdb.connect(str(settings.paths.warehouse_path), read_only=True) as con:
+        try:
+            player_id, full_name = find_player(con, player)
+            run = latest_jump_run_for_player(con, player_id, role, metric, pitch_type)
+        except LookupError as error:
+            logger.error("%s; run `statecast jumps` first if needed", error)
+            raise typer.Exit(code=1) from error
+        path_frame = load_jump_trajectory(con, run.run_id, player_id)
+    seasons = sorted(set(path_frame["game_date"].dt.year().to_list()))
+    labels = jump_chart_labels(full_name, run.metric, run.pitch_name, seasons)
+    output = settings.paths.figures_dir / figure_filename(
+        f"{full_name} jumps", run.metric, run.pitch_type
+    )
+    save_figure(plot_jump_chart(path_frame, labels), output)
     typer.echo(output)
 
 

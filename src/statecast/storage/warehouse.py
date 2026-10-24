@@ -33,6 +33,8 @@ WAREHOUSE_TABLES = frozenset(
         "model_run",
         "model_parameter",
         "latent_state",
+        "jump_run",
+        "jump_state",
     }
 )
 SEASON_DIR_PATTERN = re.compile(r"season=(\d{4})")
