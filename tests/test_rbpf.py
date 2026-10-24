@@ -207,3 +207,31 @@ def test_probabilities_are_coherent(population_result: ParticleFilterResult) -> 
     assert np.all(recent >= jump_prob - 1e-12)
     assert np.all(drop <= recent + 1e-12)
     assert float(np.min(np.asarray(population_result.effective_size))) > 1.0
+
+
+def test_posterior_odds_are_prior_odds_times_the_bayes_factor(
+    simulation: JumpSimulation, population_result: ParticleFilterResult
+) -> None:
+    prior = -np.expm1(-float(MODEL.jumps.rate) * np.asarray(simulation.batch.gap_days))
+    posterior = np.asarray(population_result.jump_prob)
+    evidence = np.asarray(population_result.jump_evidence)
+    later = (prior > 0.0) & (posterior < 1.0 - 1e-9)
+
+    prior_odds = np.log(prior[later]) - np.log1p(-prior[later])
+    posterior_odds = np.log(posterior[later]) - np.log1p(-posterior[later])
+
+    np.testing.assert_allclose(posterior_odds, prior_odds + evidence[later], atol=1e-6)
+    assert bool(np.all(np.isfinite(evidence)))
+
+
+def test_evidence_does_not_depend_on_the_jump_rate(
+    simulation: JumpSimulation,
+) -> None:
+    series = series_for(simulation, row=4)
+    rarer = MODEL._replace(jumps=MODEL.jumps._replace(rate=jnp.asarray(1e-4)))
+
+    common = run_filter(MODEL, series, jax.random.key(0), SMALL)
+    rare = run_filter(rarer, series, jax.random.key(0), SMALL)
+
+    np.testing.assert_allclose(common.jump_evidence[:2], rare.jump_evidence[:2])
+    assert float(rare.jump_prob[1]) < float(common.jump_prob[1])

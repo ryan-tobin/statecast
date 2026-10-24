@@ -7,7 +7,13 @@ import pytest
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
-from statecast.viz.jumps import LIKELY_JUMP, jump_chart_labels, plot_jump_chart
+from statecast.viz.jumps import (
+    BREAK_GAP_DAYS,
+    LIKELY_JUMP,
+    jump_chart_labels,
+    plot_jump_chart,
+    segments,
+)
 from statecast.viz.trajectories import save_figure
 
 
@@ -43,7 +49,9 @@ def two_season_jump_trajectory() -> pl.DataFrame:
             "seasonal_effect": [-0.2] * count,
             "talent_mean": talent,
             "talent_sd": [0.35] * count,
+            "prior_jump_prob": [0.007] * count,
             "jump_prob": jump_prob,
+            "jump_evidence": np.log(jump_prob / 0.007),
             "recent_jump_prob": np.minimum(1.0, jump_prob * 1.1),
             "recent_drop_prob": jump_prob,
         }
@@ -87,3 +95,33 @@ def test_plot_jump_chart_rejects_empty_trajectory() -> None:
 
     with pytest.raises(ValueError, match="no appearances"):
         plot_jump_chart(two_season_jump_trajectory().head(0), labels)
+
+
+def test_segments_split_at_long_absences() -> None:
+    days = np.array(
+        ["2025-04-01", "2025-04-06", "2025-04-11", "2025-08-01", "2025-08-06"],
+        dtype="datetime64[D]",
+    )
+
+    runs = segments(days)
+
+    assert runs == [slice(0, 3), slice(3, 5)]
+    assert segments(days[:3]) == [slice(0, 3)]
+    assert BREAK_GAP_DAYS == 30
+
+
+def test_plot_jump_chart_breaks_the_line_across_an_absence() -> None:
+    trajectory = two_season_jump_trajectory()
+    absent = (pl.col("game_date") > date(2025, 5, 15)) & (
+        pl.col("game_date") < date(2025, 8, 1)
+    )
+    with_gap = trajectory.filter(~absent)
+    labels = jump_chart_labels(
+        "Zack Wheeler", "release_speed", "4-Seam Fastball", [2025, 2026]
+    )
+
+    figure = plot_jump_chart(with_gap, labels)
+
+    talent_2025, talent_2026 = figure.axes[0], figure.axes[1]
+    assert len(talent_2025.get_lines()) == 2
+    assert len(talent_2026.get_lines()) == 1

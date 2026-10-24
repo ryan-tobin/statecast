@@ -31,7 +31,8 @@ LIMIT 1
 
 JUMP_TRAJECTORY_SQL = """
 SELECT game_date, sample_size, appearance_mean, seasonal_effect,
-       talent_mean, talent_sd, jump_prob, recent_jump_prob, recent_drop_prob
+       talent_mean, talent_sd, prior_jump_prob, jump_prob, jump_evidence,
+       recent_jump_prob, recent_drop_prob
 FROM jump_state
 WHERE run_id = $run_id AND player_id = $player_id
 ORDER BY game_date

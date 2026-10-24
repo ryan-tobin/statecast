@@ -28,9 +28,10 @@ from statecast.evaluation.injury_alerts import (
     threshold_table,
 )
 from statecast.evaluation.jump_report import (
+    ACTIVE_DAYS,
     current_drops,
-    likeliest_jumps,
     model_comparison,
+    strongest_jumps,
     with_names,
 )
 from statecast.evaluation.metric_scan import METRIC_DIRECTIONS, metric_scan
@@ -682,9 +683,9 @@ def jumps(
 
     Fits the OU model first, as the starting point and the comparison, then
     the jump model, then runs the particle filter over every player. Prints
-    the parameters, the model comparison, the games most likely to follow a
-    jump, and the players most likely to be in a recent drop at their last
-    game.
+    the parameters, the model comparison, the games with the strongest
+    evidence of a jump, and the active players most likely to be in a recent
+    drop.
 
     Args:
         role: ``pitcher`` or ``hitter``.
@@ -719,11 +720,11 @@ def jumps(
     )
     named = with_names(states, names)
     _echo_section(
-        "Games most likely to follow a jump in talent",
-        likeliest_jumps(named, JUMP_REPORT_ROWS),
+        "Games with the strongest evidence of a jump (log Bayes factor)",
+        strongest_jumps(named, JUMP_REPORT_ROWS),
     )
     _echo_section(
-        "Likeliest recent drops at each player's last game",
+        f"Likeliest recent drops, players active in the last {ACTIVE_DAYS} days",
         current_drops(named, JUMP_REPORT_ROWS),
     )
     logger.info("Saved jump run %s with %d player-games", run_id, states.height)

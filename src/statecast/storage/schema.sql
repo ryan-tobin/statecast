@@ -175,7 +175,9 @@ CREATE TABLE IF NOT EXISTS jump_state (
     seasonal_effect DOUBLE NOT NULL,
     talent_mean DOUBLE NOT NULL,
     talent_sd DOUBLE NOT NULL,
+    prior_jump_prob DOUBLE,
     jump_prob DOUBLE NOT NULL,
+    jump_evidence DOUBLE,
     recent_jump_prob DOUBLE NOT NULL,
     recent_drop_prob DOUBLE NOT NULL,
     effective_size DOUBLE NOT NULL,
@@ -189,3 +191,9 @@ ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS seasonal_effect DOUBLE DEFAULT
 ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS filtered_gap_mean DOUBLE;
 ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS filtered_gap_sd DOUBLE;
 ALTER TABLE latent_state ADD COLUMN IF NOT EXISTS alert_z DOUBLE;
+
+
+-- Migration for jump runs stored before jump evidence was recorded: older
+-- runs stay NULL and must be refitted for the evidence ranking.
+ALTER TABLE jump_state ADD COLUMN IF NOT EXISTS prior_jump_prob DOUBLE;
+ALTER TABLE jump_state ADD COLUMN IF NOT EXISTS jump_evidence DOUBLE;

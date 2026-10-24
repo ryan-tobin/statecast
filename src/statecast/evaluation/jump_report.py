@@ -9,6 +9,7 @@ from statecast.models.jumps import JUMP_PARAMETER_NAMES
 
 OU_PARAMETER_COUNT: Final = len(PARAMETER_NAMES)
 JUMP_PARAMETER_COUNT: Final = OU_PARAMETER_COUNT + len(JUMP_PARAMETER_NAMES)
+ACTIVE_DAYS: Final = 30
 
 
 def model_comparison(
@@ -63,29 +64,42 @@ def with_names(states: pl.DataFrame, names: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def likeliest_jumps(states: pl.DataFrame, top: int) -> pl.DataFrame:
-    """The games most likely to have followed a jump in talent.
+def strongest_jumps(states: pl.DataFrame, top: int) -> pl.DataFrame:
+    """The games whose data most strongly point to a jump in talent.
+
+    Ranked by ``jump_evidence`` (the log Bayes factor), not by ``jump_prob``:
+    the posterior also carries the prior chance of a jump, which approaches 1
+    after a long absence whatever the game showed. ``gap_days`` and
+    ``prior_jump_prob`` are shown so the two can be compared.
 
     Args:
         states: Named per-game output from ``with_names``.
         top: Rows to keep.
 
     Returns:
-        ``full_name``, ``game_date``, ``jump_prob``, real-time talent before
-        and after the game, and the ``change``, highest probability first.
-        A player's first game never has a jump and is left out.
+        ``full_name``, ``game_date``, ``gap_days``, ``prior_jump_prob``,
+        ``jump_prob``, ``jump_evidence``, real-time talent before and after
+        the game, and the ``change``, strongest evidence first. A player's
+        first game never has a jump and is left out.
     """
     return (
         states.with_columns(
-            talent_before=pl.col("talent_mean").shift(1).over("player_id")
+            talent_before=pl.col("talent_mean").shift(1).over("player_id"),
+            gap_days=pl.col("game_date").diff().over("player_id").dt.total_days(),
         )
-        .filter(pl.col("talent_before").is_not_null())
-        .sort("jump_prob", descending=True)
+        .filter(
+            pl.col("talent_before").is_not_null()
+            & pl.col("jump_evidence").is_not_null()
+        )
+        .sort("jump_evidence", descending=True)
         .head(top)
         .select(
             "full_name",
             "game_date",
+            "gap_days",
+            "prior_jump_prob",
             "jump_prob",
+            "jump_evidence",
             "talent_before",
             pl.col("talent_mean").alias("talent_after"),
             change=pl.col("talent_mean") - pl.col("talent_before"),
@@ -94,7 +108,11 @@ def likeliest_jumps(states: pl.DataFrame, top: int) -> pl.DataFrame:
 
 
 def current_drops(states: pl.DataFrame, top: int) -> pl.DataFrame:
-    """Players whose latest game most likely follows a recent downward jump.
+    """Active players whose latest game most likely follows a downward jump.
+
+    Only players who pitched (or batted) in the last ``ACTIVE_DAYS`` days of
+    the data count, so a player whose final game was seasons ago does not
+    crowd out current cases.
 
     Args:
         states: Named per-game output from ``with_names``.
@@ -102,12 +120,14 @@ def current_drops(states: pl.DataFrame, top: int) -> pl.DataFrame:
 
     Returns:
         ``full_name``, ``last_game``, ``talent_mean``, ``recent_jump_prob``
-        and ``recent_drop_prob`` at each player's last game, highest drop
-        probability first.
+        and ``recent_drop_prob`` at each active player's last game, highest
+        drop probability first.
     """
+    cutoff = pl.col("game_date").max() - pl.duration(days=ACTIVE_DAYS)
     return (
         states.group_by("player_id", maintain_order=True)
         .last()
+        .filter(pl.col("game_date") >= cutoff)
         .sort("recent_drop_prob", descending=True)
         .head(top)
         .select(

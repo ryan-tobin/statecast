@@ -31,12 +31,16 @@ def jump_trajectory_frame(
     Returns:
         ``player_id``, ``game_date``, ``sample_size``, the raw
         ``appearance_mean`` and its ``seasonal_effect``, the real-time
-        ``talent_mean`` and ``talent_sd`` (season-adjusted to July 1),
-        ``jump_prob``, ``recent_jump_prob``, ``recent_drop_prob`` and the
-        filter's ``effective_size``.
+        ``talent_mean`` and ``talent_sd`` (season-adjusted to July 1), the
+        ``prior_jump_prob`` from the gap before the game alone, the posterior
+        ``jump_prob``, the ``jump_evidence`` (log Bayes factor),
+        ``recent_jump_prob``, ``recent_drop_prob`` and the filter's
+        ``effective_size``.
     """
     mask = np.asarray(batch.mask)
     shift = seasonal_effect(model.population.seasonal_knots, batch.season_day)
+    rate = float(model.jumps.rate)
+    prior = -np.expm1(-rate * np.asarray(batch.gap_days))
 
     def real(values: Array) -> np.ndarray:
         real_cells: np.ndarray = np.asarray(values)[mask]
@@ -54,7 +58,9 @@ def jump_trajectory_frame(
             seasonal_effect=real(shift),
             talent_mean=real(result.talent_mean),
             talent_sd=real(result.talent_sd),
+            prior_jump_prob=prior[mask],
             jump_prob=real(result.jump_prob),
+            jump_evidence=real(result.jump_evidence),
             recent_jump_prob=real(result.recent_jump_prob),
             recent_drop_prob=real(result.recent_drop_prob),
             effective_size=real(result.effective_size),

@@ -124,7 +124,7 @@ def test_jumps_then_jump_chart_end_to_end(
     assert fitted.exit_code == 0, fitted.output
     assert "days_between_jumps" in fitted.output
     assert "OU + jumps" in fitted.output
-    assert "Games most likely to follow a jump in talent" in fitted.output
+    assert "strongest evidence of a jump" in fitted.output
     assert "Likeliest recent drops" in fitted.output
     assert drawn.exit_code == 0, drawn.output
     figures = output_dir / "outputs" / "figures"

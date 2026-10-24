@@ -78,6 +78,10 @@ class ParticleFilterResult(NamedTuple):
         talent_mean: ``E[talent | appearances 1..k]`` (July 1 equivalent).
         talent_sd: ``sd[talent | appearances 1..k]``.
         jump_prob: ``P(jump just before appearance k | 1..k)``.
+        jump_evidence: Log Bayes factor of a jump just before appearance
+            ``k``: ``log p(y_k | jump, 1..k-1) - log p(y_k | no jump,
+            1..k-1)``. Unlike ``jump_prob`` it does not depend on the prior
+            chance of a jump, so a long absence does not inflate it.
         recent_jump_prob: ``P(a jump before any of the last lag appearances
             | 1..k)``.
         recent_drop_prob: ``P(such a jump, and the latest one was downward
@@ -90,6 +94,7 @@ class ParticleFilterResult(NamedTuple):
     talent_mean: Array
     talent_sd: Array
     jump_prob: Array
+    jump_evidence: Array
     recent_jump_prob: Array
     recent_drop_prob: Array
     effective_size: Array
@@ -102,6 +107,7 @@ class _StepOutput(NamedTuple):
     talent_mean: Array
     talent_sd: Array
     jump_prob: Array
+    jump_evidence: Array
     recent_jump_prob: Array
     recent_drop_prob: Array
     effective_size: Array
@@ -253,6 +259,9 @@ def particle_filter(
             earlier_jump * drop_if_still
         )
         effective_size = 1.0 / jnp.sum(weights**2)
+        jump_evidence = logsumexp(particles.log_weights + jumped.log_likelihood) - (
+            logsumexp(particles.log_weights + still.log_likelihood)
+        )
 
         took_jump = jax.random.bernoulli(branch_key, branch_prob)
         means = jnp.where(took_jump[:, None], jumped.mean, still.mean)
@@ -283,6 +292,7 @@ def particle_filter(
             talent_mean=talent_mean,
             talent_sd=jnp.sqrt(jnp.clip(talent_var, 0.0)),
             jump_prob=jnp.sum(weights * branch_prob),
+            jump_evidence=jump_evidence,
             recent_jump_prob=jnp.sum(weights * recent),
             recent_drop_prob=jnp.sum(weights * recent_drop),
             effective_size=effective_size,
@@ -307,6 +317,7 @@ def particle_filter(
         talent_mean=outputs.talent_mean,
         talent_sd=outputs.talent_sd,
         jump_prob=outputs.jump_prob,
+        jump_evidence=outputs.jump_evidence,
         recent_jump_prob=outputs.recent_jump_prob,
         recent_drop_prob=outputs.recent_drop_prob,
         effective_size=outputs.effective_size,

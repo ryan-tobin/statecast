@@ -1,6 +1,7 @@
 """Jump chart: real-time talent from the jump model, with jump probabilities."""
 
 from dataclasses import replace
+from itertools import pairwise
 from typing import Final
 
 import matplotlib as mpl
@@ -26,12 +27,14 @@ FIGURE_WIDTH_IN: Final = 12.0
 FIGURE_HEIGHT_IN: Final = 7.2
 LIKELY_JUMP: Final = 0.5
 BAR_WIDTH_DAYS: Final = 2.0
+BREAK_GAP_DAYS: Final = 30
 Y_PADDING_FRACTION: Final = 0.06
 FOOTNOTE: Final = (
     "Talent and jump probabilities use only games played so far. A bar is the "
     "probability that talent jumped just before that game.\n"
-    "The league seasonal curve is removed from all values. Game averages also "
-    "carry one-day noise that the intervals exclude."
+    "Seasonal curve removed from all values; game averages also carry one-day "
+    "noise the intervals exclude. Lines break across absences over "
+    f"{BREAK_GAP_DAYS} days."
 )
 
 
@@ -89,20 +92,43 @@ def _panel_days(season: pl.DataFrame) -> int:
     return max(span, MIN_PANEL_DAYS)
 
 
+def segments(dates: np.ndarray) -> list[slice]:
+    """Runs of games with no absence longer than ``BREAK_GAP_DAYS``.
+
+    Args:
+        dates: Sorted game dates (``datetime64``).
+
+    Returns:
+        One slice per run, in order.
+
+    Example:
+        >>> days = np.array(["2026-04-01", "2026-04-06", "2026-06-20"],
+        ...                 dtype="datetime64[D]")
+        >>> segments(days)
+        [slice(0, 2, None), slice(2, 3, None)]
+    """
+    gaps = np.diff(dates) / np.timedelta64(1, "D")
+    breaks = (np.flatnonzero(gaps > BREAK_GAP_DAYS) + 1).tolist()
+    edges = [0, *breaks, len(dates)]
+    return [slice(start, end) for start, end in pairwise(edges)]
+
+
 def _draw_talent(axes: Axes, season: pl.DataFrame) -> None:
     """Bands, game dots, the talent line and likely jumps for one season."""
     dates = season["game_date"].to_numpy()
     center = season["talent_mean"].to_numpy()
     spread = season["talent_sd"].to_numpy()
-    for z_score, alpha in ((Z_90, 0.10), (Z_50, 0.20)):
-        axes.fill_between(
-            dates,
-            center - z_score * spread,
-            center + z_score * spread,
-            color=theme.SERIES_BLUE,
-            alpha=alpha,
-            linewidth=0,
-        )
+    runs = segments(dates)
+    for run in runs:
+        for z_score, alpha in ((Z_90, 0.10), (Z_50, 0.20)):
+            axes.fill_between(
+                dates[run],
+                center[run] - z_score * spread[run],
+                center[run] + z_score * spread[run],
+                color=theme.SERIES_BLUE,
+                alpha=alpha,
+                linewidth=0,
+            )
     axes.scatter(
         dates,
         _adjusted_game_means(season),
@@ -113,7 +139,16 @@ def _draw_talent(axes: Axes, season: pl.DataFrame) -> None:
         linewidths=0.8,
         zorder=2,
     )
-    axes.plot(dates, center, color=theme.SERIES_BLUE, linewidth=2.0, zorder=3)
+    for run in runs:
+        axes.plot(
+            dates[run],
+            center[run],
+            color=theme.SERIES_BLUE,
+            linewidth=2.0,
+            marker="o" if run.stop - run.start == 1 else "",
+            markersize=3,
+            zorder=3,
+        )
     likely = season["jump_prob"].to_numpy() >= LIKELY_JUMP
     axes.scatter(
         dates[likely],

@@ -76,7 +76,9 @@ def jump_states(player_ids: list[int]) -> pl.DataFrame:
             "seasonal_effect": [-0.2] * count,
             "talent_mean": [94.9] * count,
             "talent_sd": [0.4] * count,
+            "prior_jump_prob": [0.02] * count,
             "jump_prob": [0.1] * count,
+            "jump_evidence": [1.7] * count,
             "recent_jump_prob": [0.3] * count,
             "recent_drop_prob": [0.2] * count,
             "effective_size": [200.0] * count,
@@ -148,6 +150,8 @@ def test_save_jump_run_stores_every_table(
     stored = load_jump_trajectory(connection, run_id, 554430)
     assert stored.height == 2
     assert stored["recent_drop_prob"].to_list() == [0.2, 0.2]
+    assert stored["jump_evidence"].to_list() == [1.7, 1.7]
+    assert stored["prior_jump_prob"].to_list() == [0.02, 0.02]
 
 
 def test_save_jump_run_rolls_back_when_a_write_fails(
